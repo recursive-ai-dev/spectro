@@ -26,7 +26,7 @@ physical models.
 
 ---
 
-## 🔥 Key Idea: “Algorithm Deconstruction”
+## Key Idea: “Algorithm Deconstruction”
 SSGS is built using the same philosophy behind the Symbo project:
 
 > **Break apart many algorithms, strip them to their mathematical essence,
@@ -52,7 +52,7 @@ system keeps working.
 
 ---
 
-## 🎵 Pipeline Overview
+## Pipeline Overview
 
 ### **1. LPC Analysis**
 The training signal is segmented and analyzed with LPC to extract:
@@ -126,7 +126,7 @@ This is how SSGS generates *novel signals* even from short or simple training da
 
 ---
 
-## 📊 Example Output
+## Example Output
 
 SSGS produces time-domain and spectral visualizations like this:
 
@@ -137,7 +137,7 @@ it is a **new trajectory** through learned spectral states.
 
 ---
 
-## 🧪 Testing
+## Testing
 
 Run the included test script:
 
@@ -161,14 +161,14 @@ scipy>=1.7.0
 matplotlib>=3.4.0
 soundfile>=0.10.0
 
-📁 Project Structure
+Project Structure
 ssgs.py            # Full model implementation
 test_ssgs.py       # Training + generation demo
 requirements.txt   # Dependencies
 ssgs_demo.png      # Example output
 README.md          # This document
 
-✍️ Authors
+Authors
 
 Damien Davison & Michael Maillet
 Recursive AI Devs
@@ -179,7 +179,7 @@ into new model classes.
 
 If you use SSGS in research or production, please cite the authors.
 
-📜 License — Apache 2.0
+License — Apache 2.0
 
 This project is licensed under the Apache License, Version 2.0.
 
