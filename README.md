@@ -158,18 +158,18 @@ save or display diagnostics
 
 ### Requirements
 
-numpy>=1.21.0
-scipy>=1.7.0
-matplotlib>=3.4.0
-soundfile>=0.10.0
+numpy>=1.21.0 \
+scipy>=1.7.0 \
+matplotlib>=3.4.0 \
+soundfile>=0.10.0 \
 
 ### Project Structure
 
-ssgs.py            # Full model implementation
-test_ssgs.py       # Training + generation demo
-requirements.txt   # Dependencies
-ssgs_demo.png      # Example output
-README.md          # This document
+ssgs.py            # Full model implementation \
+test_ssgs.py       # Training + generation demo \
+requirements.txt   # Dependencies \
+ssgs_demo.png      # Example output \
+README.md          # This document \
 
 
 ### Authors
