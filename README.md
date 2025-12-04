@@ -192,3 +192,9 @@ you may not use this file except in compliance with the License.
 You may obtain a copy at:
 
    http://www.apache.org/licenses/LICENSE-2.0
+
+## NOTICE
+
+This product includes original work by:  
+**Damien Davison & Michael Maillet (Recursive AI Devs)**  
+Additional details can be found in the project's LICENSE and source headers.
