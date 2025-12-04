@@ -155,18 +155,22 @@ plot time-domain and spectral comparison
 
 save or display diagnostics
 
-🛠 Requirements
+
+Requirements:
+
 numpy>=1.21.0
 scipy>=1.7.0
 matplotlib>=3.4.0
 soundfile>=0.10.0
 
 Project Structure
+
 ssgs.py            # Full model implementation
 test_ssgs.py       # Training + generation demo
 requirements.txt   # Dependencies
 ssgs_demo.png      # Example output
 README.md          # This document
+
 
 Authors
 
@@ -178,6 +182,7 @@ algorithm decomposition — extracting the useful primitives and recombining the
 into new model classes.
 
 If you use SSGS in research or production, please cite the authors.
+
 
 License — Apache 2.0
 
