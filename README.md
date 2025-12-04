@@ -2,6 +2,7 @@
 ### © 2025 Damien Davison & Michael Maillet  
 ### Recursive AI Devs  
 Licensed under the Apache License 2.0
+psychcoherence@gmail.com OR therealmichaelmaillet@gmail.com
 
 SSGS (Spectral-State Guided Synthesis) is a hybrid generative audio model that
 combines **linear predictive coding (LPC)**, **hidden Markov models (HMMs)**,
