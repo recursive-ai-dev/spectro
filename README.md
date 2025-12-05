@@ -1,5 +1,5 @@
 # SSGS — Spectral-State Guided Synthesis
-### © 2025 Damien Davison & Michael Maillet  
+### © 2025 Damien Davison & Michael Maillet & Sacha Davison 
 ### Recursive AI Devs  
 Licensed under the Apache License 2.0
 psychcoherence@gmail.com OR therealmichaelmaillet@gmail.com
@@ -174,7 +174,7 @@ README.md          # This document \
 
 ### Authors
 
-Damien Davison & Michael Maillet
+Damien Davison & Michael Maillet & Sacha Davison
 Recursive AI Devs
 
 We build hybrid-symbolic neural, statistical, and physical AI systems by
@@ -201,5 +201,5 @@ You may obtain a copy at:
 ## NOTICE
 
 This product includes original work by:  
-**Damien Davison & Michael Maillet (Recursive AI Devs)**  
+**Damien Davison & Michael Maillet & Sacha Davison (Recursive AI Devs)**  
 Additional details can be found in the project's LICENSE and source headers.
