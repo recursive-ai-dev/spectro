@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+title: "Spectro: Spectral State-Guided Synthesis (SSGS)"
+message: "If you use Spectro or the SSGS algorithm in your research or software, please cite it using this metadata."
+type: software
+
+authors:
+  - family-names: Davison
+    given-names: Damien
+  - family-names: Maillet
+    given-names: Michael
+  - family-names: Davison
+    given-names: Sacha
+
+abstract: >
+  Spectro implements the Spectral State-Guided Synthesis (SSGS) algorithm: a 
+  hybrid generative audio system that decouples high-level temporal structure 
+  from low-level spectral content using Hidden Markov Models (HMMs), 
+  Linear Predictive Coding (LPC), Karplus–Strong excitation, and A* search. 
+  The model learns spectral states from LPC coefficient clusters, optimizes 
+  transitions through EM-based HMM refinement, and synthesizes new audio by 
+  decoding optimal state sequences and filtering state-conditioned excitation 
+  signals. This architecture enables controllable, interpretable, and 
+  data-efficient procedural sound generation.
+
+version: "1.0.0"
+date-released: 2025-01-01
+license: "Apache-2.0"
+
+repository-code: "https://github.com/recursive-ai-dev/spectro"
+url: "https://github.com/recursive-ai-dev/spectro"
