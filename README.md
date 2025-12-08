@@ -126,6 +126,23 @@ This is how SSGS generates *novel signals* even from short or simple training da
 
 ---
 
+## Model Export & Compression
+
+After training you can persist the learned parameters in a compact archive:
+
+```python
+ssgs.export_model("models/ssgs_baseline", use_compression=True, pack_covariances=True)
+```
+
+- `.npz` output uses ZIP compression by default when `use_compression=True`.
+- Covariance matrices are serialized as lower-triangular slices to halve their
+   stored size.
+- Set `include_training_artifacts=True` if you also need cached LPC and residual
+   buffers for later analysis.
+- Reload the model with `SpectralStateGuidedSynthesis.load_model(path)`.
+
+---
+
 ## Example Output
 
 SSGS produces time-domain and spectral visualizations like this:

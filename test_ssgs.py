@@ -122,8 +122,8 @@ def analyze_and_plot_results(ssgs, original_signal, generated_signal, sample_rat
     
     # 3. Spectrograms
     def compute_spectrogram(signal, sample_rate):
-        f, t, Sxx = plt.specgram(signal, Fs=sample_rate, NFFT=1024, noverlap=512)
-        return f, t, 10 * np.log10(Sxx + 1e-10)
+        power, freqs, bins, _ = plt.specgram(signal, Fs=sample_rate, NFFT=1024, noverlap=512)
+        return freqs, bins, 10 * np.log10(power + 1e-10)
     
     f_orig, t_spec_orig, S_orig = compute_spectrogram(original_signal, sample_rate)
     f_gen, t_spec_gen, S_gen = compute_spectrogram(generated_signal, sample_rate)
@@ -273,7 +273,8 @@ def run_comprehensive_test():
         test_signal = generated_signal[:len(original_signal)]
     
     # Signal-to-Noise Ratio (treating one as reference)
-    snr_db = 10 * np.log10(np.sum(test_signal**2) / (np.sum((test_signal - generated_signal[:len(test_signal)]**2)) + 1e-10))
+    error_power = np.sum((test_signal - generated_signal[:len(test_signal)])**2) + 1e-10
+    snr_db = 10 * np.log10(np.sum(test_signal**2) / error_power)
     print(f"Signal-to-Noise Ratio: {snr_db:.2f} dB")
     
     # HMM model complexity analysis
