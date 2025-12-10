@@ -16,12 +16,19 @@
 # limitations under the License.
 
 import json
+import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+
+# Configure module logger
+logger = logging.getLogger(__name__)
+
+__version__ = "1.0.0"
+
 from scipy import signal
 from scipy.cluster import vq
 from scipy.linalg import LinAlgError, cholesky, solve_toeplitz, solve_triangular
@@ -41,7 +48,11 @@ except ImportError:  # pragma: no cover - older SciPy fallback
     def _strong_components(graph):
         return _scipy_cc(graph, directed=True, connection="strong")
 
-warnings.filterwarnings('ignore')
+# Note: Warning filtering has been removed for production safety.
+# If specific warnings need suppression, use context managers:
+# with warnings.catch_warnings():
+#     warnings.filterwarnings('ignore', category=SpecificWarning)
+#     # your code here
 
 
 @dataclass
@@ -1501,24 +1512,73 @@ class SpectralStateGuidedSynthesis:
     def _lpc_synthesis_filter(self, excitation, lpc_coeffs):
         """
         Phase 2, Step 7: Audio Synthesis using LPC filtering
-        
+
         Args:
             excitation: Excitation signal
             lpc_coeffs: LPC coefficients
-            
+
         Returns:
             synthesized_audio: Filtered audio signal
         """
         filter_coeffs = np.concatenate([[1.0], lpc_coeffs])
         try:
             synthesized = signal.lfilter([1.0], filter_coeffs, excitation).astype(np.float32)
-        except Exception:
+        except (ValueError, LinAlgError, RuntimeError) as e:
+            logger.warning(f"LPC filter failed ({type(e).__name__}: {e}), falling back to convolution")
             synthesized = np.convolve(excitation, filter_coeffs[::-1], mode="same").astype(np.float32)
 
         max_val = np.max(np.abs(synthesized))
         if max_val > 0:
             synthesized = synthesized / max_val * 0.8
         return synthesized
+
+    def _get_training_residual_for_state(self, state, rng=None):
+        """
+        Get a representative residual from training data for a given state.
+
+        Args:
+            state: HMM state index
+            rng: Random number generator (optional)
+
+        Returns:
+            residual: Training residual signal for this state
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if self.residual_signals is None or self.residual_signals.size == 0:
+            # No residuals available, return noise
+            return rng.standard_normal(self.hop_size).astype(np.float32) * 0.05
+
+        assignments = self._estimate_state_assignments()
+        if assignments is None:
+            # Fallback: use random training residual
+            idx = rng.integers(0, len(self.residual_signals))
+            residual = self.residual_signals[idx]
+        else:
+            # Get residuals for frames assigned to this state
+            mask = assignments == state
+            if np.any(mask):
+                # Randomly select one of the frames assigned to this state
+                state_indices = np.where(mask)[0]
+                idx = rng.choice(state_indices)
+                residual = self.residual_signals[idx]
+            else:
+                # State has no assignments, use random residual
+                idx = rng.integers(0, len(self.residual_signals))
+                residual = self.residual_signals[idx]
+
+        # Ensure correct length
+        if residual.shape[0] < self.hop_size:
+            residual = np.pad(
+                residual,
+                (0, self.hop_size - residual.shape[0]),
+                mode="constant",
+            )
+        elif residual.shape[0] > self.hop_size:
+            residual = residual[: self.hop_size]
+
+        return residual.astype(np.float32, copy=True)
 
     def render_preview(self, n_frames=32, sample_rate=None, state_sequence=None):
         """Generate a lightweight audio preview using cached prototypes.
@@ -1584,32 +1644,54 @@ class SpectralStateGuidedSynthesis:
         preview = np.tanh(preview_buffer[:required_samples])
         return preview.astype(np.float32), sample_rate
     
-    def synthesize_audio(self, target_duration_seconds, sample_rate=16000):
+    def synthesize_audio(self, target_duration_seconds, sample_rate=16000, fidelity=0.0):
         """
         Phase 2: Complete Audio Synthesis Pipeline
-        
+
         Args:
             target_duration_seconds: Target duration in seconds
             sample_rate: Output sample rate
-            
+            fidelity: Reconstruction fidelity (0.0-1.0)
+                     0.0 = fully synthetic (Karplus-Strong excitation)
+                     1.0 = high fidelity reconstruction (training residuals)
+                     Values in between blend both approaches
+
         Returns:
             audio_output: Generated audio signal
         """
         if self.transition_matrix is None:
             raise ValueError("Must train the model first using extract_features() and iterative_refinement()")
-        
+
+        if not 0.0 <= fidelity <= 1.0:
+            raise ValueError("fidelity must be between 0.0 and 1.0")
+
         target_frames = int(target_duration_seconds * sample_rate / self.hop_size)
         print(f"Synthesizing {target_duration_seconds}s of audio ({target_frames} frames)")
-        
+        print(f"Fidelity: {fidelity:.2f} (0.0=synthetic, 1.0=reconstruction)")
+
         # Step 5: Decode optimal state sequence using A* search
         print("Step 5: Decoding state sequence with A* search...")
         state_sequence = self._a_star_search(target_frames)
 
         audio_output = np.zeros(target_frames * self.hop_size, dtype=np.float32)
+        rng = np.random.default_rng()
 
         print("Step 6-8: Generating excitation, synthesizing audio...")
         for idx, state in enumerate(state_sequence):
-            excitation = self._karplus_strong_excitation(state, self.hop_size)
+            if fidelity >= 1.0:
+                # Pure reconstruction mode: use training residuals only
+                excitation = self._get_training_residual_for_state(state, rng)
+            elif fidelity <= 0.0:
+                # Pure synthetic mode: use Karplus-Strong only
+                excitation = self._karplus_strong_excitation(state, self.hop_size)
+            else:
+                # Blend mode: mix both approaches
+                residual_excitation = self._get_training_residual_for_state(state, rng)
+                synthetic_excitation = self._karplus_strong_excitation(state, self.hop_size)
+                # Linear blend based on fidelity parameter
+                excitation = (fidelity * residual_excitation +
+                            (1.0 - fidelity) * synthetic_excitation)
+
             frame_audio = self._lpc_synthesis_filter(excitation, self.state_means[state])
             start = idx * self.hop_size
             end = start + self.hop_size
@@ -1810,26 +1892,30 @@ class SpectralStateGuidedSynthesis:
         
         print("Training complete!")
     
-    def generate(self, duration_seconds, sample_rate=16000):
+    def generate(self, duration_seconds, sample_rate=16000, fidelity=0.0):
         """
         Generate new audio
-        
+
         Args:
             duration_seconds: Duration of generated audio
             sample_rate: Output sample rate
-            
+            fidelity: Reconstruction fidelity (0.0-1.0)
+                     0.0 = fully synthetic/novel generation
+                     1.0 = high fidelity reconstruction of training audio
+                     0.5 = balanced mix showing variance
+
         Returns:
             Generated audio signal
         """
         print("Phase 2: Inference (Audio Generation)")
         print("=" * 50)
-        
-        return self.synthesize_audio(duration_seconds, sample_rate)
+
+        return self.synthesize_audio(duration_seconds, sample_rate, fidelity=fidelity)
 
 
 def example_usage():
     """
-    Example demonstrating how to use the SSGS system
+    Example demonstrating how to use the SSGS system with fidelity control
     """
     # Initialize SSGS
     ssgs = SpectralStateGuidedSynthesis(
@@ -1838,12 +1924,12 @@ def example_usage():
         frame_size=1024,
         hop_size=256
     )
-    
+
     # Generate a simple training signal (sine wave with harmonics)
     sample_rate = 16000
     duration = 2.0
     t = np.linspace(0, duration, int(sample_rate * duration))
-    
+
     # Create harmonic-rich signal for training
     training_signal = (
         0.5 * np.sin(2 * np.pi * 220 * t) +  # A3 fundamental
@@ -1851,30 +1937,67 @@ def example_usage():
         0.2 * np.sin(2 * np.pi * 660 * t) +  # E5 fifth
         0.1 * np.sin(2 * np.pi * 880 * t)    # A5 double octave
     )
-    
+
     # Add some envelope variation
     envelope = 0.5 + 0.5 * np.sin(2 * np.pi * 0.5 * t)
     training_signal *= envelope
-    
+
     # Add slight noise for realism
     training_signal += 0.01 * np.random.randn(len(training_signal))
-    
+
     print("Spectral-State Guided Synthesis (SSGS) Example")
     print("=" * 50)
-    
+
     # Train the model
     ssgs.train(training_signal, sample_rate, n_em_iterations=10)
-    
-    # Generate new audio
-    generated_audio = ssgs.generate(duration_seconds=3.0, sample_rate=sample_rate)
-    
-    print(f"\nGenerated audio with {len(generated_audio)} samples")
-    print(f"Duration: {len(generated_audio) / sample_rate:.2f} seconds")
-    print(f"Max amplitude: {np.max(np.abs(generated_audio)):.3f}")
-    
-    return ssgs, generated_audio
+
+    # Generate audio with different fidelity levels
+    print("\n" + "=" * 50)
+    print("Generating audio with different fidelity levels:")
+    print("=" * 50)
+
+    # High fidelity (reconstruction - should sound like original)
+    print("\n1. High fidelity reconstruction (fidelity=1.0)")
+    reconstructed_audio = ssgs.generate(
+        duration_seconds=2.0,
+        sample_rate=sample_rate,
+        fidelity=1.0
+    )
+
+    # Medium fidelity (balanced variance)
+    print("\n2. Balanced variance (fidelity=0.5)")
+    balanced_audio = ssgs.generate(
+        duration_seconds=2.0,
+        sample_rate=sample_rate,
+        fidelity=0.5
+    )
+
+    # Low fidelity (fully synthetic/novel)
+    print("\n3. Fully synthetic generation (fidelity=0.0)")
+    synthetic_audio = ssgs.generate(
+        duration_seconds=3.0,
+        sample_rate=sample_rate,
+        fidelity=0.0
+    )
+
+    print("\n" + "=" * 50)
+    print("Generation complete!")
+    print(f"Reconstructed: {len(reconstructed_audio)} samples ({len(reconstructed_audio)/sample_rate:.2f}s)")
+    print(f"Balanced: {len(balanced_audio)} samples ({len(balanced_audio)/sample_rate:.2f}s)")
+    print(f"Synthetic: {len(synthetic_audio)} samples ({len(synthetic_audio)/sample_rate:.2f}s)")
+
+    return ssgs, {
+        'training': training_signal,
+        'reconstructed': reconstructed_audio,
+        'balanced': balanced_audio,
+        'synthetic': synthetic_audio
+    }
 
 
 if __name__ == "__main__":
     # Run the example
-    ssgs, audio = example_usage()
+    ssgs, audio_dict = example_usage()
+    print("\nTip: Use fidelity parameter to control reconstruction vs. generation:")
+    print("  - fidelity=1.0: Direct copy/reconstruction of training audio")
+    print("  - fidelity=0.5: Balanced variance (mix of original and novel)")
+    print("  - fidelity=0.0: Fully synthetic/novel generation")
