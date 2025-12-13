@@ -1551,7 +1551,13 @@ class SpectralStateGuidedSynthesis:
             return arr
 
         floor = max(0.0, float(minimum_peak))
-        target = max(floor, float(target_peak))
+        target = float(target_peak)
+        if target < floor:
+            raise ValueError("target_peak must be greater than or equal to minimum_peak")
+
+        if target <= 0.0:
+            target = floor
+
         scaled = arr * (target / peak)
         return scaled.astype(np.float32, copy=False)
 
