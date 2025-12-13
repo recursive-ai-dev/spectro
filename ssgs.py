@@ -1551,8 +1551,8 @@ class SpectralStateGuidedSynthesis:
             return arr
 
         floor = float(minimum_peak)
-        if floor < 0.0:
-            raise ValueError("minimum_peak must be non-negative")
+        if floor <= 0.0:
+            raise ValueError("minimum_peak must be positive")
 
         target = float(target_peak)
         if target <= 0.0:
