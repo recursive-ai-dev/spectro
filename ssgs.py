@@ -1560,7 +1560,14 @@ class SpectralStateGuidedSynthesis:
         if target < floor:
             raise ValueError("target_peak must be greater than or equal to minimum_peak")
 
-        scaled = arr * (target / peak)
+        if peak < floor:
+            target_level = floor
+        elif peak > target:
+            target_level = target
+        else:
+            return arr
+
+        scaled = arr * (target_level / peak)
         return scaled.astype(np.float32, copy=False)
 
     def _get_training_residual_for_state(self, state, rng=None):
