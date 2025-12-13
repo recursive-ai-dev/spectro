@@ -1560,7 +1560,7 @@ class SpectralStateGuidedSynthesis:
         if target < floor:
             raise ValueError("target_peak must be greater than or equal to minimum_peak")
 
-        if peak < floor:
+        if peak <= floor:
             target_level = floor
         elif peak > target:
             target_level = target

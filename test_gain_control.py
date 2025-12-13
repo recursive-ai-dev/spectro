@@ -10,8 +10,10 @@ def test_gain_floor_raises_quiet_audio():
 
     boosted = model._apply_gain_floor(quiet, minimum_peak=0.75, target_peak=0.9)
 
+    boosted_peak = np.max(np.abs(boosted))
+
     assert boosted.dtype == np.float32
-    assert np.max(np.abs(boosted)) >= 0.75 - 1e-3
+    assert boosted_peak == pytest.approx(0.75, rel=0.0, abs=1e-3)
 
 
 def test_synthesis_applies_gain_floor(monkeypatch):
