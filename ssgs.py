@@ -1532,6 +1532,44 @@ class SpectralStateGuidedSynthesis:
             synthesized = synthesized / max_val * 0.8
         return synthesized
 
+    def _apply_gain_floor(
+        self,
+        audio: np.ndarray,
+        *,
+        minimum_peak: float = 0.75,
+        target_peak: float = 0.9,
+    ) -> np.ndarray:
+        """
+        Normalize audio while ensuring a minimum peak level for audibility.
+        """
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.size == 0:
+            return arr
+
+        peak = float(np.max(np.abs(arr)))
+        if peak <= 0.0:
+            return arr
+
+        floor = float(minimum_peak)
+        if floor <= 0.0:
+            raise ValueError("minimum_peak must be positive")
+
+        target = float(target_peak)
+        if target <= 0.0:
+            raise ValueError("target_peak must be positive")
+        if target < floor:
+            raise ValueError("target_peak must be greater than or equal to minimum_peak")
+
+        if peak <= floor:
+            target_level = floor
+        elif peak > target:
+            target_level = target
+        else:
+            return arr
+
+        scaled = arr * (target_level / peak)
+        return scaled.astype(np.float32, copy=False)
+
     def _get_training_residual_for_state(self, state, rng=None):
         """
         Get a representative residual from training data for a given state.
@@ -1642,6 +1680,7 @@ class SpectralStateGuidedSynthesis:
             preview_buffer[:required_samples] *= np.hanning(required_samples)
 
         preview = np.tanh(preview_buffer[:required_samples])
+        preview = self._apply_gain_floor(preview, minimum_peak=0.75, target_peak=0.9)
         return preview.astype(np.float32), sample_rate
     
     def synthesize_audio(self, target_duration_seconds, sample_rate=16000, fidelity=0.0):
@@ -1700,10 +1739,7 @@ class SpectralStateGuidedSynthesis:
         window = np.hanning(len(audio_output))
         audio_output *= window
 
-        peak = np.max(np.abs(audio_output))
-        if peak > 0:
-            audio_output = audio_output / peak * 0.9
-
+        audio_output = self._apply_gain_floor(audio_output, minimum_peak=0.75, target_peak=0.9)
         return audio_output.astype(np.float32)
     
     def export_model(
