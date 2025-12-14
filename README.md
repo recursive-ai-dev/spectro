@@ -143,6 +143,29 @@ ssgs.export_model("models/ssgs_baseline", use_compression=True, pack_covariances
 
 ---
 
+## Generative Capability Levels
+
+SSGS now offers enhanced generative capabilities through configurable state counts:
+
+- **Standard (16 states)**: Original baseline configuration
+- **Enhanced (34 states)**: 112% increase - recommended for most applications
+- **Maximum (42 states)**: 163% increase - highest generative capacity
+
+```python
+# Enhanced generative capabilities (default)
+ssgs = SpectralStateGuidedSynthesis(n_states=34)
+
+# Maximum generative capabilities
+ssgs = SpectralStateGuidedSynthesis(n_states=42)
+
+# Original baseline
+ssgs = SpectralStateGuidedSynthesis(n_states=16)
+```
+
+More states = more spectral patterns the model can learn and generate = richer, more diverse output.
+
+---
+
 ## Example Output
 
 SSGS produces time-domain and spectral visualizations like this:
