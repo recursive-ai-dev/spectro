@@ -60,7 +60,7 @@ def test_enhanced_generative_capabilities_112_percent():
     sample_rate = 16000
     signal = create_simple_test_signal(sample_rate, duration=1.0)
     
-    # Initialize with enhanced capabilities (112% increase: 16 * 2.12 = 34)
+    # Initialize with enhanced capabilities (112% increase: 16 + 16*1.12 ≈ 34)
     ssgs = SpectralStateGuidedSynthesis(
         n_states=34,
         lpc_order=12,
@@ -104,7 +104,7 @@ def test_maximum_generative_capabilities_163_percent():
     sample_rate = 16000
     signal = create_simple_test_signal(sample_rate, duration=1.0)
     
-    # Initialize with maximum capabilities (163% increase: 16 * 2.63 = 42)
+    # Initialize with maximum capabilities (163% increase: 16 + 16*1.63 ≈ 42)
     ssgs = SpectralStateGuidedSynthesis(
         n_states=42,
         lpc_order=12,
