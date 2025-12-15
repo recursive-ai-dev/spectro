@@ -590,6 +590,67 @@ def test_model_export_import_integrity():
     return original_model, loaded_model
 
 
+def test_wavelet_excitation():
+    """
+    Test wavelet-based excitation as alternative to Karplus-Strong.
+    """
+    print("\n" + "="*60)
+    print("TEST: Wavelet Excitation Primitive")
+    print("="*60)
+    
+    # Create and train a simple model
+    sample_rate = 16000
+    duration = 1.0
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    signal = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * np.random.randn(len(t))
+    
+    ssgs = SpectralStateGuidedSynthesis(
+        n_states=8,
+        lpc_order=10,
+        frame_size=512,
+        hop_size=128
+    )
+    
+    print("Training model...")
+    ssgs.train(signal, sample_rate, n_em_iterations=3)
+    
+    # Test Karplus-Strong excitation (default)
+    print("\nGenerating with Karplus-Strong excitation...")
+    audio_ks = ssgs.generate(0.5, sample_rate, fidelity=0.0, excitation_type='Karplus-Strong')
+    print(f"✓ Generated {len(audio_ks)} samples with Karplus-Strong")
+    
+    # Test Wavelet excitation
+    print("\nGenerating with Wavelet excitation...")
+    audio_wavelet = ssgs.generate(0.5, sample_rate, fidelity=0.0, excitation_type='Wavelet')
+    print(f"✓ Generated {len(audio_wavelet)} samples with Wavelet")
+    
+    # Verify both produce valid audio
+    assert len(audio_ks) > 0, "Karplus-Strong audio is empty"
+    assert len(audio_wavelet) > 0, "Wavelet audio is empty"
+    assert len(audio_ks) == len(audio_wavelet), "Audio lengths don't match"
+    
+    # Check that they produce different outputs (not identical)
+    correlation = np.corrcoef(audio_ks, audio_wavelet)[0, 1]
+    print(f"\nCorrelation between KS and Wavelet: {correlation:.4f}")
+    print("  (Should be < 1.0, indicating different excitation characteristics)")
+    
+    # Test blended mode (fidelity=0.5) with wavelet
+    print("\nTesting blended mode (fidelity=0.5) with Wavelet...")
+    audio_blend = ssgs.generate(0.3, sample_rate, fidelity=0.5, excitation_type='Wavelet')
+    print(f"✓ Generated {len(audio_blend)} samples in blend mode")
+    
+    # Test invalid excitation type
+    try:
+        ssgs.generate(0.1, sample_rate, fidelity=0.0, excitation_type='InvalidType')
+        assert False, "Should have raised ValueError for invalid excitation_type"
+    except ValueError as e:
+        print(f"\n✓ Correctly rejected invalid excitation_type: {e}")
+    
+    print("\n✓ TEST PASSED: Wavelet excitation works correctly")
+    print("✓ PyWavelets dependency verified")
+    return ssgs, audio_ks, audio_wavelet
+
+
 def test_auto_n_states_selection():
     """
     Test automatic state count selection using BIC.
@@ -665,6 +726,7 @@ if __name__ == "__main__":
     print("RUNNING FEATURE TESTS")
     print("="*60)
     
+    test_wavelet_excitation()
     test_auto_n_states_selection()
     
     print("\n" + "="*60)

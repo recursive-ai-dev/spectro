@@ -1673,6 +1673,102 @@ class SpectralStateGuidedSynthesis:
         excitation *= envelope
         return excitation
     
+    def _wavelet_excitation(self, state, duration_samples):
+        """
+        Wavelet-based excitation generation as an alternative to Karplus-Strong.
+        
+        Uses inverse wavelet transform of coefficients derived from the current
+        spectral state to generate excitation signals with different textural
+        characteristics.
+        
+        Args:
+            state: HMM state for parameterization
+            duration_samples: Number of samples to generate
+            
+        Returns:
+            excitation_signal: Wavelet-based excitation signal
+        """
+        try:
+            import pywt
+        except ImportError:
+            raise ImportError(
+                "PyWavelets is required for wavelet excitation. "
+                "Install with: pip install PyWavelets"
+            )
+        
+        mean_coeffs = self.state_means[state]
+        
+        # Select wavelet type based on spectral characteristics
+        spectral_centroid = np.mean(np.abs(mean_coeffs))
+        spectral_variance = np.var(mean_coeffs)
+        
+        # Choose wavelet family based on spectral properties
+        # High variance -> more complex wavelet (db4)
+        # Low variance -> simpler wavelet (haar, db2)
+        if spectral_variance > 0.1:
+            wavelet_name = 'db4'  # Daubechies 4
+        elif spectral_variance > 0.05:
+            wavelet_name = 'db2'  # Daubechies 2
+        else:
+            wavelet_name = 'haar'  # Simplest
+        
+        # Determine decomposition level based on duration
+        max_level = pywt.dwt_max_level(duration_samples, wavelet_name)
+        decomp_level = min(max_level, 4)  # Cap at 4 levels
+        
+        # Generate wavelet coefficients from spectral state
+        # Use LPC coefficients to modulate wavelet structure
+        rng = np.random.default_rng()
+        
+        # Create wavelet packet with state-dependent characteristics
+        # Detail coefficients (high frequency) influenced by LPC magnitude
+        detail_scale = float(np.linalg.norm(mean_coeffs))
+        
+        # Approximation coefficients (low frequency) influenced by spectral centroid
+        approx_scale = float(1.0 + spectral_centroid)
+        
+        # Generate base signal with controlled randomness
+        base_length = duration_samples
+        base_signal = rng.standard_normal(base_length).astype(np.float32)
+        
+        # Decompose signal
+        coeffs = pywt.wavedec(base_signal, wavelet_name, level=decomp_level)
+        
+        # Modulate coefficients based on spectral state
+        # Approximation coefficients (lowest frequency)
+        coeffs[0] = coeffs[0] * approx_scale * 0.5
+        
+        # Detail coefficients (higher frequencies)
+        for i in range(1, len(coeffs)):
+            # Scale detail coefficients by LPC-derived values
+            if i <= len(mean_coeffs):
+                scale_factor = float(np.abs(mean_coeffs[i-1]) * detail_scale)
+            else:
+                scale_factor = detail_scale * 0.5
+            coeffs[i] = coeffs[i] * scale_factor * 0.3
+        
+        # Reconstruct signal from modified coefficients
+        excitation = pywt.waverec(coeffs, wavelet_name)
+        
+        # Ensure correct length
+        if len(excitation) > duration_samples:
+            excitation = excitation[:duration_samples]
+        elif len(excitation) < duration_samples:
+            excitation = np.pad(excitation, (0, duration_samples - len(excitation)), mode='constant')
+        
+        excitation = excitation.astype(np.float32)
+        
+        # Apply envelope for natural attack/decay
+        envelope = np.exp(-np.linspace(0, 3, duration_samples)).astype(np.float32)
+        excitation *= envelope
+        
+        # Normalize
+        max_val = np.max(np.abs(excitation))
+        if max_val > 0:
+            excitation = excitation / max_val * 0.5
+        
+        return excitation
+    
     def _lpc_synthesis_filter(self, excitation, lpc_coeffs):
         """
         Phase 2, Step 7: Audio Synthesis using LPC filtering
@@ -1847,7 +1943,7 @@ class SpectralStateGuidedSynthesis:
         preview = self._apply_gain_floor(preview, minimum_peak=0.75, target_peak=0.9)
         return preview.astype(np.float32), sample_rate
     
-    def synthesize_audio(self, target_duration_seconds, sample_rate=16000, fidelity=0.0):
+    def synthesize_audio(self, target_duration_seconds, sample_rate=16000, fidelity=0.0, excitation_type='Karplus-Strong'):
         """
         Phase 2: Complete Audio Synthesis Pipeline
 
@@ -1855,9 +1951,11 @@ class SpectralStateGuidedSynthesis:
             target_duration_seconds: Target duration in seconds
             sample_rate: Output sample rate
             fidelity: Reconstruction fidelity (0.0-1.0)
-                     0.0 = fully synthetic (Karplus-Strong excitation)
+                     0.0 = fully synthetic (uses excitation_type)
                      1.0 = high fidelity reconstruction (training residuals)
                      Values in between blend both approaches
+            excitation_type: Type of excitation for synthesis ('Karplus-Strong' or 'Wavelet')
+                           Only used when fidelity < 1.0
 
         Returns:
             audio_output: Generated audio signal
@@ -1867,10 +1965,15 @@ class SpectralStateGuidedSynthesis:
 
         if not 0.0 <= fidelity <= 1.0:
             raise ValueError("fidelity must be between 0.0 and 1.0")
+        
+        if excitation_type not in ['Karplus-Strong', 'Wavelet']:
+            raise ValueError("excitation_type must be 'Karplus-Strong' or 'Wavelet'")
 
         target_frames = int(target_duration_seconds * sample_rate / self.hop_size)
         print(f"Synthesizing {target_duration_seconds}s of audio ({target_frames} frames)")
         print(f"Fidelity: {fidelity:.2f} (0.0=synthetic, 1.0=reconstruction)")
+        if fidelity < 1.0:
+            print(f"Excitation type: {excitation_type}")
 
         # Step 5: Decode optimal state sequence using A* search
         print("Step 5: Decoding state sequence with A* search...")
@@ -1885,12 +1988,18 @@ class SpectralStateGuidedSynthesis:
                 # Pure reconstruction mode: use training residuals only
                 excitation = self._get_training_residual_for_state(state, rng)
             elif fidelity <= 0.0:
-                # Pure synthetic mode: use Karplus-Strong only
-                excitation = self._karplus_strong_excitation(state, self.hop_size)
+                # Pure synthetic mode: use selected excitation type
+                if excitation_type == 'Karplus-Strong':
+                    excitation = self._karplus_strong_excitation(state, self.hop_size)
+                else:  # Wavelet
+                    excitation = self._wavelet_excitation(state, self.hop_size)
             else:
                 # Blend mode: mix both approaches
                 residual_excitation = self._get_training_residual_for_state(state, rng)
-                synthetic_excitation = self._karplus_strong_excitation(state, self.hop_size)
+                if excitation_type == 'Karplus-Strong':
+                    synthetic_excitation = self._karplus_strong_excitation(state, self.hop_size)
+                else:  # Wavelet
+                    synthetic_excitation = self._wavelet_excitation(state, self.hop_size)
                 # Linear blend based on fidelity parameter
                 excitation = (fidelity * residual_excitation +
                             (1.0 - fidelity) * synthetic_excitation)
@@ -2092,7 +2201,7 @@ class SpectralStateGuidedSynthesis:
         
         print("Training complete!")
     
-    def generate(self, duration_seconds, sample_rate=16000, fidelity=0.0):
+    def generate(self, duration_seconds, sample_rate=16000, fidelity=0.0, excitation_type='Karplus-Strong'):
         """
         Generate new audio
 
@@ -2103,6 +2212,7 @@ class SpectralStateGuidedSynthesis:
                      0.0 = fully synthetic/novel generation
                      1.0 = high fidelity reconstruction of training audio
                      0.5 = balanced mix showing variance
+            excitation_type: Type of excitation ('Karplus-Strong' or 'Wavelet')
 
         Returns:
             Generated audio signal
@@ -2110,7 +2220,7 @@ class SpectralStateGuidedSynthesis:
         print("Phase 2: Inference (Audio Generation)")
         print("=" * 50)
 
-        return self.synthesize_audio(duration_seconds, sample_rate, fidelity=fidelity)
+        return self.synthesize_audio(duration_seconds, sample_rate, fidelity=fidelity, excitation_type=excitation_type)
 
 
 def example_usage():
