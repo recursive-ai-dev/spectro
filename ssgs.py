@@ -129,6 +129,12 @@ class SpectralStateGuidedSynthesis:
     structure from low-level spectral content using HMM and LPC synthesis.
     """
     
+    # Class constants for configuration
+    DEFAULT_BIC_CANDIDATES = [8, 16, 24, 32]
+    WAVELET_VARIANCE_HIGH = 0.1
+    WAVELET_VARIANCE_MED = 0.05
+    EXCITATION_NORMALIZATION_SCALE = 0.5
+    
     def __init__(
         self,
         n_states=34,
@@ -143,13 +149,18 @@ class SpectralStateGuidedSynthesis:
         
         Args:
             n_states: Number of HMM states (default: 34 for enhanced generative capabilities)
-                     Ignored if auto_n_states=True
+                     NOTE: This parameter is ignored when auto_n_states=True. In that case,
+                     the optimal state count will be selected automatically during training.
             lpc_order: Order of Linear Prediction coefficients
             frame_size: Size of analysis frames
             hop_size: Hop size between frames
             smoothness_weight: Weight for spectral smoothness heuristic
-            auto_n_states: If True, automatically select optimal n_states using BIC
+            auto_n_states: If True, automatically select optimal n_states using BIC.
+                          When enabled, the n_states parameter is ignored and the optimal
+                          value is determined during initialize_hmm_parameters().
         """
+        if auto_n_states:
+            logger.info("auto_n_states enabled: n_states parameter will be determined automatically")
         self.n_states = n_states
         self.lpc_order = lpc_order
         self.frame_size = frame_size
@@ -1081,13 +1092,13 @@ class SpectralStateGuidedSynthesis:
         Select optimal number of states using BIC.
         
         Args:
-            candidate_counts: List of state counts to test (default: [8, 16, 24, 32])
+            candidate_counts: List of state counts to test (default: DEFAULT_BIC_CANDIDATES)
             
         Returns:
             optimal_n_states: Selected state count
         """
         if candidate_counts is None:
-            candidate_counts = [8, 16, 24, 32]
+            candidate_counts = self.DEFAULT_BIC_CANDIDATES
         
         print(f"Auto-selecting n_states from candidates: {candidate_counts}")
         
@@ -1705,9 +1716,9 @@ class SpectralStateGuidedSynthesis:
         # Choose wavelet family based on spectral properties
         # High variance -> more complex wavelet (db4)
         # Low variance -> simpler wavelet (haar, db2)
-        if spectral_variance > 0.1:
+        if spectral_variance > self.WAVELET_VARIANCE_HIGH:
             wavelet_name = 'db4'  # Daubechies 4
-        elif spectral_variance > 0.05:
+        elif spectral_variance > self.WAVELET_VARIANCE_MED:
             wavelet_name = 'db2'  # Daubechies 2
         else:
             wavelet_name = 'haar'  # Simplest
@@ -1765,7 +1776,7 @@ class SpectralStateGuidedSynthesis:
         # Normalize
         max_val = np.max(np.abs(excitation))
         if max_val > 0:
-            excitation = excitation / max_val * 0.5
+            excitation = excitation / max_val * self.EXCITATION_NORMALIZATION_SCALE
         
         return excitation
     
