@@ -590,6 +590,64 @@ def test_model_export_import_integrity():
     return original_model, loaded_model
 
 
+def test_auto_n_states_selection():
+    """
+    Test automatic state count selection using BIC.
+    """
+    print("\n" + "="*60)
+    print("TEST: Automatic State Count Selection (BIC)")
+    print("="*60)
+    
+    # Create test signal
+    sample_rate = 16000
+    duration = 1.0
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    
+    # Create signal with clear frequency changes (should benefit from more states)
+    signal = np.concatenate([
+        0.5 * np.sin(2 * np.pi * 220 * t[:len(t)//3]),
+        0.5 * np.sin(2 * np.pi * 440 * t[:len(t)//3]),
+        0.5 * np.sin(2 * np.pi * 660 * t[:len(t)//3]),
+    ])
+    signal += 0.05 * np.random.randn(len(signal))
+    
+    # Test with auto_n_states=True
+    print("\nTesting auto_n_states=True...")
+    ssgs = SpectralStateGuidedSynthesis(
+        n_states=34,  # This will be ignored
+        lpc_order=12,
+        frame_size=1024,
+        hop_size=256,
+        auto_n_states=True
+    )
+    
+    print("Extracting features...")
+    ssgs.extract_features(signal, sample_rate)
+    
+    print("Initializing HMM parameters with auto state selection...")
+    ssgs.initialize_hmm_parameters()
+    
+    # Check that n_states was selected
+    selected_n_states = ssgs.n_states
+    print(f"\n✓ Auto-selected n_states: {selected_n_states}")
+    assert selected_n_states in [8, 16, 24, 32], f"Selected n_states {selected_n_states} not in candidate list!"
+    
+    # Verify model is functional
+    print("Running brief EM training...")
+    ssgs.iterative_refinement(n_iterations=2)
+    
+    print(f"✓ Model trained successfully with {selected_n_states} states")
+    
+    # Test synthesis
+    print("Testing synthesis...")
+    audio = ssgs.generate(0.3, sample_rate, fidelity=0.0)
+    assert len(audio) > 0, "Generated audio is empty!"
+    print(f"✓ Generated {len(audio)} samples")
+    
+    print("\n✓ TEST PASSED: Auto state selection works correctly")
+    return ssgs
+
+
 if __name__ == "__main__":
     # Run the comprehensive test
     ssgs, orig, gen = run_comprehensive_test()
@@ -604,5 +662,11 @@ if __name__ == "__main__":
     test_model_export_import_integrity()
     
     print("\n" + "="*60)
-    print("ALL VERIFICATION TESTS PASSED!")
+    print("RUNNING FEATURE TESTS")
+    print("="*60)
+    
+    test_auto_n_states_selection()
+    
+    print("\n" + "="*60)
+    print("ALL TESTS PASSED!")
     print("="*60)

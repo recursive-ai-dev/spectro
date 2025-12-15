@@ -136,21 +136,26 @@ class SpectralStateGuidedSynthesis:
         frame_size=1024,
         hop_size=256,
         smoothness_weight=0.5,
+        auto_n_states=False,
     ):
         """
         Initialize SSGS parameters
         
         Args:
             n_states: Number of HMM states (default: 34 for enhanced generative capabilities)
+                     Ignored if auto_n_states=True
             lpc_order: Order of Linear Prediction coefficients
             frame_size: Size of analysis frames
             hop_size: Hop size between frames
+            smoothness_weight: Weight for spectral smoothness heuristic
+            auto_n_states: If True, automatically select optimal n_states using BIC
         """
         self.n_states = n_states
         self.lpc_order = lpc_order
         self.frame_size = frame_size
         self.hop_size = hop_size
         self.smoothness_weight = smoothness_weight
+        self.auto_n_states = auto_n_states
         
         # Internal state containers keep responsibilities isolated yet accessible.
         self._params = _ModelParameters()
@@ -947,16 +952,175 @@ class SpectralStateGuidedSynthesis:
         self._compute_and_cache_cholesky_factors()
         self.augmentation_applied = True
 
+    def _compute_hmm_bic(self, n_states, n_em_iterations=3):
+        """
+        Compute Bayesian Information Criterion (BIC) for an HMM with given state count.
+        
+        Args:
+            n_states: Number of states to test
+            n_em_iterations: Number of EM iterations for fitting
+            
+        Returns:
+            bic: BIC score (lower is better)
+        """
+        if self.lpc_coefficients is None:
+            raise ValueError("Must extract features first")
+        
+        num_frames = self.lpc_coefficients.shape[0]
+        
+        # Save current state
+        original_n_states = self.n_states
+        original_params = (
+            self.transition_matrix,
+            self.initial_probabilities,
+            self.state_means,
+            self.state_covariances,
+        )
+        
+        try:
+            # Temporarily set n_states
+            self.n_states = n_states
+            
+            # Initialize HMM with this state count
+            coeff_mean = np.mean(self.lpc_coefficients, axis=0)
+            
+            if (
+                self.perceptual_features is not None
+                and self.perceptual_features.shape[0] == num_frames
+            ):
+                clustering_features = np.hstack([
+                    self.lpc_coefficients,
+                    self.perceptual_features,
+                ])
+            else:
+                clustering_features = self.lpc_coefficients
+            
+            clustering_features = clustering_features.astype(np.float64, copy=False)
+            feature_mean = clustering_features.mean(axis=0)
+            feature_std = clustering_features.std(axis=0) + 1e-6
+            normalized_features = (clustering_features - feature_mean) / feature_std
+            
+            centroids, labels = vq.kmeans2(normalized_features, n_states, minit="++", iter=20)
+            if isinstance(labels, tuple):
+                labels = labels[0]
+            
+            self.initial_probabilities = np.zeros(n_states, dtype=np.float64)
+            self.transition_matrix = np.zeros((n_states, n_states), dtype=np.float64)
+            self.state_means = np.zeros((n_states, self.lpc_order), dtype=np.float64)
+            self.state_covariances = np.array(
+                [np.eye(self.lpc_order, dtype=np.float64) * 0.05 for _ in range(n_states)]
+            )
+            
+            # Initialize parameters from clustering
+            for state in range(n_states):
+                mask = labels == state
+                if not np.any(mask):
+                    self.state_means[state] = coeff_mean
+                    continue
+                state_coeffs = self.lpc_coefficients[mask]
+                self.state_means[state] = state_coeffs.mean(axis=0)
+                centered = state_coeffs - self.state_means[state]
+                cov = np.dot(centered.T, centered) / (len(state_coeffs) - 1 + 1e-9)
+                cov += np.eye(self.lpc_order) * 1e-4
+                self.state_covariances[state] = cov
+            
+            for idx, state in enumerate(labels):
+                if idx == 0:
+                    self.initial_probabilities[state] += 1.0
+                else:
+                    prev_state = labels[idx - 1]
+                    self.transition_matrix[prev_state, state] += 1.0
+            
+            self.initial_probabilities += 1e-3
+            self.initial_probabilities /= self.initial_probabilities.sum()
+            
+            self.transition_matrix += 1e-6
+            row_sums = self.transition_matrix.sum(axis=1, keepdims=True)
+            self.transition_matrix /= row_sums
+            
+            self._reset_caches()
+            self._compute_and_cache_cholesky_factors()
+            
+            # Run a few EM iterations
+            for _ in range(n_em_iterations):
+                gamma, xi, log_likelihood = self._expectation_step(self.lpc_coefficients)
+                self._maximization_step(self.lpc_coefficients, gamma, xi)
+            
+            # Final log-likelihood
+            _, _, log_likelihood = self._expectation_step(self.lpc_coefficients)
+            
+            # Compute number of free parameters
+            # Transition matrix: n_states * (n_states - 1) (rows sum to 1)
+            # Initial probs: n_states - 1 (sum to 1)
+            # State means: n_states * lpc_order
+            # State covariances: n_states * lpc_order * (lpc_order + 1) / 2 (symmetric)
+            n_transition_params = n_states * (n_states - 1)
+            n_init_params = n_states - 1
+            n_mean_params = n_states * self.lpc_order
+            n_cov_params = n_states * self.lpc_order * (self.lpc_order + 1) // 2
+            n_params = n_transition_params + n_init_params + n_mean_params + n_cov_params
+            
+            # BIC = -2 * log_likelihood + k * log(n)
+            bic = -2 * log_likelihood + n_params * np.log(num_frames)
+            
+            return bic
+            
+        finally:
+            # Restore original state
+            self.n_states = original_n_states
+            (
+                self.transition_matrix,
+                self.initial_probabilities,
+                self.state_means,
+                self.state_covariances,
+            ) = original_params
+            self._reset_caches()
+    
+    def _select_optimal_n_states(self, candidate_counts=None):
+        """
+        Select optimal number of states using BIC.
+        
+        Args:
+            candidate_counts: List of state counts to test (default: [8, 16, 24, 32])
+            
+        Returns:
+            optimal_n_states: Selected state count
+        """
+        if candidate_counts is None:
+            candidate_counts = [8, 16, 24, 32]
+        
+        print(f"Auto-selecting n_states from candidates: {candidate_counts}")
+        
+        bic_scores = {}
+        for n in candidate_counts:
+            if n > len(self.lpc_coefficients):
+                print(f"  Skipping n_states={n} (exceeds frame count)")
+                continue
+            print(f"  Testing n_states={n}...", end=" ")
+            bic = self._compute_hmm_bic(n, n_em_iterations=3)
+            bic_scores[n] = bic
+            print(f"BIC={bic:.2f}")
+        
+        optimal_n_states = min(bic_scores, key=bic_scores.get)
+        print(f"Selected optimal n_states={optimal_n_states} (lowest BIC)")
+        
+        return optimal_n_states
+
     def initialize_hmm_parameters(self):
         """
         Phase 1, Step 2: State Initialization using Clustering
         
-        Uses k-means clustering to initialize HMM parameters from LPC coefficients
+        Uses k-means clustering to initialize HMM parameters from LPC coefficients.
+        If auto_n_states=True, automatically selects optimal state count using BIC.
         """
         if self.lpc_coefficients is None:
             raise ValueError("Must extract features first using extract_features()")
 
         self._apply_residual_augmentation()
+        
+        # Auto-select n_states if enabled
+        if self.auto_n_states:
+            self.n_states = self._select_optimal_n_states()
 
         num_frames = self.lpc_coefficients.shape[0]
         if num_frames < self.n_states:
