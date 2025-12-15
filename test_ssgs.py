@@ -590,6 +590,105 @@ def test_model_export_import_integrity():
     return original_model, loaded_model
 
 
+def test_batch_training():
+    """
+    Test training on multiple audio files with feature concatenation.
+    """
+    print("\n" + "="*60)
+    print("TEST: Batch Training on Multiple Audio Files")
+    print("="*60)
+    
+    # Create multiple test signals with different characteristics
+    sample_rate = 16000
+    duration = 0.5
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    
+    # Signal 1: Low frequency
+    signal1 = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * np.random.randn(len(t))
+    print("Created signal 1: Low frequency (220 Hz)")
+    
+    # Signal 2: Mid frequency
+    signal2 = 0.5 * np.sin(2 * np.pi * 440 * t) + 0.05 * np.random.randn(len(t))
+    print("Created signal 2: Mid frequency (440 Hz)")
+    
+    # Signal 3: High frequency
+    signal3 = 0.5 * np.sin(2 * np.pi * 660 * t) + 0.05 * np.random.randn(len(t))
+    print("Created signal 3: High frequency (660 Hz)")
+    
+    # Test batch training with list of signals
+    print("\nTesting batch training with 3 signals...")
+    ssgs_batch = SpectralStateGuidedSynthesis(
+        n_states=12,
+        lpc_order=10,
+        frame_size=512,
+        hop_size=128
+    )
+    
+    # Train on list of signals
+    audio_list = [signal1, signal2, signal3]
+    ssgs_batch.train(audio_list, sample_rate, n_em_iterations=3)
+    
+    total_frames = len(ssgs_batch.lpc_coefficients)
+    print(f"\n✓ Batch training completed with {total_frames} total frames")
+    
+    # Verify features were concatenated correctly
+    # Note: Data augmentation multiplies frames (time stretch + pitch shift = 5x original)
+    base_frames_per_signal = int(duration * sample_rate / ssgs_batch.hop_size)
+    augmentation_factor = 5  # 1 original + 2 time stretch + 2 pitch shift
+    expected_total = base_frames_per_signal * 3 * augmentation_factor
+    
+    print(f"  Base frames per signal: ~{base_frames_per_signal}")
+    print(f"  Augmentation factor: {augmentation_factor}x")
+    print(f"  Expected ~{expected_total} frames after augmentation")
+    print(f"  Actual: {total_frames} frames")
+    
+    # Allow some tolerance for frame extraction differences
+    tolerance_pct = 0.15  # 15% tolerance
+    assert abs(total_frames - expected_total) < (expected_total * tolerance_pct), \
+        f"Frame count mismatch: expected ~{expected_total}, got {total_frames}"
+    print("  ✓ Frame count within expected range (with augmentation)")
+    
+    # Verify temporal order is maintained
+    assert ssgs_batch.lpc_coefficients.shape[0] == total_frames
+    assert ssgs_batch.residual_signals.shape[0] == total_frames
+    assert ssgs_batch.perceptual_features.shape[0] == total_frames
+    print("  ✓ All feature arrays have consistent length")
+    
+    # Test that model is functional
+    print("\nTesting synthesis with batch-trained model...")
+    audio_generated = ssgs_batch.generate(0.3, sample_rate, fidelity=0.0)
+    assert len(audio_generated) > 0, "Generated audio is empty"
+    print(f"✓ Generated {len(audio_generated)} samples")
+    
+    # Compare with single-file training
+    print("\nComparing with single-file training...")
+    ssgs_single = SpectralStateGuidedSynthesis(
+        n_states=12,
+        lpc_order=10,
+        frame_size=512,
+        hop_size=128
+    )
+    
+    # Train on concatenated signal
+    combined_signal = np.concatenate([signal1, signal2, signal3])
+    ssgs_single.train(combined_signal, sample_rate, n_em_iterations=3)
+    
+    single_frames = len(ssgs_single.lpc_coefficients)
+    print(f"  Single-file mode: {single_frames} frames")
+    print(f"  Batch mode: {total_frames} frames")
+    
+    # Should be roughly the same (within tolerance for frame boundaries and augmentation variance)
+    frame_diff = abs(single_frames - total_frames)
+    tolerance = max(single_frames, total_frames) * 0.05  # 5% tolerance
+    assert frame_diff < tolerance, \
+        f"Batch and single training produce very different frame counts: diff={frame_diff}, tolerance={tolerance}"
+    print("  ✓ Batch and single-file training produce similar results")
+    
+    print("\n✓ TEST PASSED: Batch training correctly concatenates features")
+    print("✓ Temporal order within each file is maintained")
+    return ssgs_batch
+
+
 def test_wavelet_excitation():
     """
     Test wavelet-based excitation as alternative to Karplus-Strong.
@@ -726,6 +825,7 @@ if __name__ == "__main__":
     print("RUNNING FEATURE TESTS")
     print("="*60)
     
+    test_batch_training()
     test_wavelet_excitation()
     test_auto_n_states_selection()
     

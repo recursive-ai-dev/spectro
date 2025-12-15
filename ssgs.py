@@ -2153,6 +2153,92 @@ class SpectralStateGuidedSynthesis:
         model._transition_cost_matrix()
         return model
 
+    def _extract_features_from_files(self, audio_files, sample_rate=16000):
+        """
+        Extract features from multiple audio files and concatenate them.
+        
+        Args:
+            audio_files: List of file paths or audio signal arrays
+            sample_rate: Sampling rate (used if loading from files)
+            
+        Returns:
+            None (sets internal state)
+        """
+        all_frames = []
+        all_lpc_coefficients = []
+        all_residual_signals = []
+        all_perceptual_features = []
+        all_spectral_flux = []
+        
+        for idx, audio_input in enumerate(audio_files):
+            print(f"  Processing file {idx + 1}/{len(audio_files)}...")
+            
+            # Load audio if it's a file path
+            if isinstance(audio_input, (str, Path)):
+                try:
+                    import soundfile as sf
+                    audio_signal, file_sr = sf.read(audio_input)
+                    if audio_signal.ndim > 1:
+                        # Convert to mono if stereo
+                        audio_signal = audio_signal.mean(axis=1)
+                    # Resample if needed
+                    if file_sr != sample_rate:
+                        from scipy.signal import resample
+                        num_samples = int(len(audio_signal) * sample_rate / file_sr)
+                        audio_signal = resample(audio_signal, num_samples)
+                    audio_signal = audio_signal.astype(np.float32)
+                except Exception as e:
+                    raise ValueError(f"Failed to load audio file {audio_input}: {e}")
+            else:
+                # Already an array
+                audio_signal = np.asarray(audio_input, dtype=np.float32)
+            
+            # Extract features for this file
+            frames = self._frame_signal(audio_signal)
+            
+            mel_filters = self._mel_filter_bank(sample_rate, self.frame_size)
+            erb_filters = self._erb_filter_bank(sample_rate, self.frame_size)
+            window = np.hanning(self.frame_size).astype(np.float32)
+            
+            (
+                processed_frames,
+                lpc_coeffs,
+                residuals,
+                perceptual_vectors,
+                flux_values,
+            ) = self._process_frame_batch(frames, mel_filters, erb_filters, window)
+            
+            if processed_frames.size > 0:
+                all_frames.append(processed_frames)
+                all_lpc_coefficients.append(lpc_coeffs)
+                all_residual_signals.append(residuals)
+                all_perceptual_features.append(perceptual_vectors)
+                all_spectral_flux.append(flux_values)
+                print(f"    Extracted {len(lpc_coeffs)} frames")
+        
+        if not all_frames:
+            raise ValueError("No valid frames extracted from any files")
+        
+        # Concatenate all features while preserving temporal order within each file
+        self.training_frames = np.concatenate(all_frames, axis=0)
+        self.lpc_coefficients = np.concatenate(all_lpc_coefficients, axis=0)
+        self.residual_signals = np.concatenate(all_residual_signals, axis=0)
+        self.perceptual_features = np.concatenate(all_perceptual_features, axis=0)
+        self.spectral_flux = np.concatenate(all_spectral_flux, axis=0)
+        self.sample_rate = int(sample_rate)
+        
+        print(f"  Total extracted: {len(self.lpc_coefficients)} frames from {len(audio_files)} files")
+        
+        # Compute metadata for combined features
+        self._compute_frame_metadata(self.sample_rate)
+        if self.spectral_flux is not None and self.spectral_flux.size:
+            metadata = self.frame_metadata
+            metadata["spectral_flux"] = self.spectral_flux
+            self.frame_metadata = metadata
+        
+        self._reset_caches()
+        self._compute_and_cache_cholesky_factors()
+
     def train(
         self,
         audio_signal,
@@ -2167,7 +2253,7 @@ class SpectralStateGuidedSynthesis:
         Complete training pipeline
         
         Args:
-            audio_signal: Training audio signal
+            audio_signal: Training audio signal (single array) or list of audio signals/file paths
             sample_rate: Sampling rate
             n_em_iterations: Number of EM iterations
             preview_every: Forward previews every N EM iterations (0 disables)
@@ -2179,8 +2265,15 @@ class SpectralStateGuidedSynthesis:
         
         # Step 1: Feature Extraction
         print("Step 1: Extracting features (LPC analysis)...")
-        self.extract_features(audio_signal, sample_rate)
-        print(f"Extracted {len(self.lpc_coefficients)} frames of LPC coefficients")
+        
+        # Check if we have multiple files/signals
+        if isinstance(audio_signal, (list, tuple)):
+            print(f"Batch mode: Training on {len(audio_signal)} audio files/signals")
+            self._extract_features_from_files(audio_signal, sample_rate)
+        else:
+            # Single signal
+            self.extract_features(audio_signal, sample_rate)
+            print(f"Extracted {len(self.lpc_coefficients)} frames of LPC coefficients")
         
         # Step 2: State Initialization
         print("Step 2: Initializing HMM parameters...")
