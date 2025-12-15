@@ -131,7 +131,7 @@ class SpectralStateGuidedSynthesis:
     
     def __init__(
         self,
-        n_states=16,
+        n_states=34,
         lpc_order=12,
         frame_size=1024,
         hop_size=256,
@@ -141,7 +141,7 @@ class SpectralStateGuidedSynthesis:
         Initialize SSGS parameters
         
         Args:
-            n_states: Number of HMM states
+            n_states: Number of HMM states (default: 34 for enhanced generative capabilities)
             lpc_order: Order of Linear Prediction coefficients
             frame_size: Size of analysis frames
             hop_size: Hop size between frames
@@ -1953,9 +1953,9 @@ def example_usage():
     """
     Example demonstrating how to use the SSGS system with fidelity control
     """
-    # Initialize SSGS
+    # Initialize SSGS with enhanced generative capabilities (34 states)
     ssgs = SpectralStateGuidedSynthesis(
-        n_states=16,
+        n_states=34,
         lpc_order=12,
         frame_size=1024,
         hop_size=256
