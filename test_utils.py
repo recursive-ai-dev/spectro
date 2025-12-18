@@ -118,7 +118,7 @@ def create_rich_test_signal(sample_rate=16000, duration=2.0):
         duration=duration,
         base_freq_offset=30,
         harmonic_range=(1, 7),
-        include_fundamental=False,  # Will be added in harmonic_range
+        include_fundamental=False,  # Harmonics start from 1 in range
         attack_time=0.15,
         decay_time=0.3,
         noise_level=0.005,
@@ -214,7 +214,7 @@ def create_fidelity_demo_signal(sample_rate=16000, duration=3.0):
     # Add slight noise
     signal += 0.005 * np.random.randn(len(signal))
     
-    # Normalize
-    signal = signal / np.max(np.abs(signal)) * 0.8
+    # Normalize with safety guard
+    signal = signal / (np.max(np.abs(signal)) + 1e-10) * 0.8
     
     return signal
