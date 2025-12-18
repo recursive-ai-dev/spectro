@@ -18,55 +18,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import soundfile as sf
 from ssgs import SpectralStateGuidedSynthesis
+from test_utils import create_test_signal
 import warnings
 warnings.filterwarnings('ignore')
-
-def create_test_signal(sample_rate=16000, duration=2.0):
-    """
-    Create a complex test signal with multiple frequency components
-    """
-    t = np.linspace(0, duration, int(sample_rate * duration))
-    
-    # Base frequency that changes over time (pitch contour)
-    base_freq = 220 + 50 * np.sin(2 * np.pi * 0.5 * t)  # Vibrato
-    
-    # Generate harmonic series with time-varying amplitudes
-    signal = np.zeros_like(t)
-    
-    # Fundamental
-    signal += 0.6 * np.sin(2 * np.pi * base_freq * t)
-    
-    # Harmonics with varying strengths
-    for h in range(2, 6):
-        freq = base_freq * h
-        amplitude = 0.3 / h  # Natural harmonic decay
-        amplitude *= (1 + 0.3 * np.sin(2 * np.pi * h * 0.2 * t))  # Modulation
-        signal += amplitude * np.sin(2 * np.pi * freq * t)
-    
-    # Add formant-like characteristics (vocal-like resonances)
-    formant1 = 800 + 100 * np.sin(2 * np.pi * 0.3 * t)
-    formant2 = 1200 + 150 * np.sin(2 * np.pi * 0.4 * t)
-    
-    signal += 0.2 * np.sin(2 * np.pi * formant1 * t) * np.exp(-t/duration)
-    signal += 0.15 * np.sin(2 * np.pi * formant2 * t) * np.exp(-t/duration)
-    
-    # Apply overall envelope (attack, sustain, decay)
-    attack_time = 0.1
-    decay_time = 0.3
-    
-    envelope = np.ones_like(t)
-    attack_idx = int(attack_time * sample_rate)
-    decay_start_idx = int((duration - decay_time) * sample_rate)
-    
-    envelope[:attack_idx] = np.linspace(0, 1, attack_idx)
-    envelope[decay_start_idx:] = np.linspace(1, 0, len(envelope) - decay_start_idx)
-    
-    signal *= envelope
-    
-    # Add small amount of noise for realism
-    signal += 0.005 * np.random.randn(len(signal))
-    
-    return signal
 
 def analyze_and_plot_results(ssgs, original_signal, generated_signal, sample_rate=16000):
     """
