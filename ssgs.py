@@ -2247,13 +2247,23 @@ class SpectralStateGuidedSynthesis:
         
         # Handle optional features that might be empty or inconsistent
         if all_perceptual_features and len(all_perceptual_features) == len(all_frames):
-            self.perceptual_features = np.concatenate(all_perceptual_features, axis=0)
+            try:
+                self.perceptual_features = np.concatenate(all_perceptual_features, axis=0)
+            except (ValueError, np.AxisError) as e:
+                # Shape mismatch during concatenation
+                print(f"Warning: Could not concatenate perceptual features: {e}")
+                self.perceptual_features = np.array([], dtype=np.float32)
         else:
             # No perceptual features or inconsistent per-file counts
             self.perceptual_features = np.array([], dtype=np.float32)
         
         if all_spectral_flux and len(all_spectral_flux) == len(all_frames):
-            self.spectral_flux = np.concatenate(all_spectral_flux, axis=0)
+            try:
+                self.spectral_flux = np.concatenate(all_spectral_flux, axis=0)
+            except (ValueError, np.AxisError) as e:
+                # Shape mismatch during concatenation
+                print(f"Warning: Could not concatenate spectral flux: {e}")
+                self.spectral_flux = np.array([], dtype=np.float32)
         else:
             # No spectral flux features or inconsistent per-file counts
             self.spectral_flux = np.array([], dtype=np.float32)
