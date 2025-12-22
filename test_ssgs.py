@@ -341,7 +341,11 @@ def test_astar_vs_viterbi_decoding():
     
     # Verify A* is globally smoother (lower spectral cost)
     # Note: A* should have lower or equal spectral cost due to smoothness heuristic
-    print(f"\n✓ A* spectral cost is {'lower' if astar_spectral_cost <= viterbi_spectral_cost else 'higher'} than Viterbi")
+    assert astar_spectral_cost <= viterbi_spectral_cost, (
+        f"A* should produce lower or equal spectral cost, but got "
+        f"A*={astar_spectral_cost:.4f} > Viterbi={viterbi_spectral_cost:.4f}"
+    )
+    print(f"\n✓ A* spectral cost is {'lower' if astar_spectral_cost < viterbi_spectral_cost else 'equal to'} Viterbi")
     print(f"✓ A* uses smoothness heuristic: cost = -log(P) + {ssgs.smoothness_weight} * smoothness + 0.25 * psycho_weight")
     
     # Check that cost function is correctly implemented

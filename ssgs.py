@@ -981,6 +981,7 @@ class SpectralStateGuidedSynthesis:
         
         # Save current state
         original_n_states = self.n_states
+        original_augmentation_applied = self.augmentation_applied
         original_params = (
             self.transition_matrix,
             self.initial_probabilities,
@@ -1079,6 +1080,7 @@ class SpectralStateGuidedSynthesis:
         finally:
             # Restore original state
             self.n_states = original_n_states
+            self.augmentation_applied = original_augmentation_applied
             (
                 self.transition_matrix,
                 self.initial_probabilities,
@@ -1111,6 +1113,13 @@ class SpectralStateGuidedSynthesis:
             bic = self._compute_hmm_bic(n, n_em_iterations=3)
             bic_scores[n] = bic
             print(f"BIC={bic:.2f}")
+        
+        if not bic_scores:
+            raise ValueError(
+                f"No valid candidate state counts found. All candidates {candidate_counts} "
+                f"exceed frame count ({len(self.lpc_coefficients)}). "
+                f"Please use smaller state counts or provide more training data."
+            )
         
         optimal_n_states = min(bic_scores, key=bic_scores.get)
         print(f"Selected optimal n_states={optimal_n_states} (lowest BIC)")
@@ -1752,8 +1761,9 @@ class SpectralStateGuidedSynthesis:
         # Detail coefficients (higher frequencies)
         for i in range(1, len(coeffs)):
             # Scale detail coefficients by LPC-derived values
-            if i <= len(mean_coeffs):
-                scale_factor = float(np.abs(mean_coeffs[i-1]) * detail_scale)
+            mean_idx = i - 1
+            if mean_idx < len(mean_coeffs):
+                scale_factor = float(np.abs(mean_coeffs[mean_idx]) * detail_scale)
             else:
                 scale_factor = detail_scale * 0.5
             coeffs[i] = coeffs[i] * scale_factor * 0.3
@@ -2234,8 +2244,20 @@ class SpectralStateGuidedSynthesis:
         self.training_frames = np.concatenate(all_frames, axis=0)
         self.lpc_coefficients = np.concatenate(all_lpc_coefficients, axis=0)
         self.residual_signals = np.concatenate(all_residual_signals, axis=0)
-        self.perceptual_features = np.concatenate(all_perceptual_features, axis=0)
-        self.spectral_flux = np.concatenate(all_spectral_flux, axis=0)
+        
+        # Handle optional features that might be empty or inconsistent
+        if all_perceptual_features and len(all_perceptual_features) == len(all_frames):
+            self.perceptual_features = np.concatenate(all_perceptual_features, axis=0)
+        else:
+            # No perceptual features or inconsistent per-file counts
+            self.perceptual_features = np.array([], dtype=np.float32)
+        
+        if all_spectral_flux and len(all_spectral_flux) == len(all_frames):
+            self.spectral_flux = np.concatenate(all_spectral_flux, axis=0)
+        else:
+            # No spectral flux features or inconsistent per-file counts
+            self.spectral_flux = np.array([], dtype=np.float32)
+        
         self.sample_rate = int(sample_rate)
         
         print(f"  Total extracted: {len(self.lpc_coefficients)} frames from {len(audio_files)} files")
