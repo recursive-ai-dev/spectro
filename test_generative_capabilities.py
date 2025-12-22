@@ -22,31 +22,7 @@ Test enhanced generative capabilities (112% and 163% increases)
 import numpy as np
 import pytest
 from ssgs import SpectralStateGuidedSynthesis
-
-
-def create_simple_test_signal(sample_rate=16000, duration=1.0):
-    """Create a simple test signal for quick testing"""
-    t = np.linspace(0, duration, int(sample_rate * duration))
-    # Create a richer harmonic signal with noise for robustness
-    base_freq = 220 + 20 * np.sin(2 * np.pi * 0.5 * t)
-    signal = (
-        0.5 * np.sin(2 * np.pi * base_freq * t) +
-        0.3 * np.sin(2 * np.pi * base_freq * 2 * t) +
-        0.2 * np.sin(2 * np.pi * base_freq * 3 * t) +
-        0.1 * np.sin(2 * np.pi * base_freq * 4 * t)
-    )
-    # Add envelope with smoother transitions
-    attack = int(0.1 * len(signal))
-    decay = int(0.1 * len(signal))
-    envelope = np.ones(len(signal))
-    envelope[:attack] = np.linspace(0, 1, attack)
-    envelope[-decay:] = np.linspace(1, 0, decay)
-    signal *= envelope
-    # Add noise for better LPC stability
-    signal += 0.01 * np.random.randn(len(signal))
-    # Normalize
-    signal = signal / (np.max(np.abs(signal)) + 1e-10) * 0.8
-    return signal
+from test_utils import create_simple_test_signal
 
 
 def test_default_uses_enhanced_capabilities():

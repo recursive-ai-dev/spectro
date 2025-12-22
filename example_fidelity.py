@@ -16,6 +16,7 @@ Fidelity Levels:
 import numpy as np
 import matplotlib.pyplot as plt
 from ssgs import SpectralStateGuidedSynthesis
+from test_utils import create_fidelity_demo_signal
 
 try:
     import soundfile as sf
@@ -50,43 +51,9 @@ def load_or_create_training_audio(audio_file=None, sample_rate=16000, duration=3
             print(f"Error loading audio file: {e}")
             print("Falling back to synthetic signal...")
 
-    # Create synthetic training signal
+    # Create synthetic training signal using common utility
     print("Creating synthetic training signal...")
-    t = np.linspace(0, duration, int(sample_rate * duration))
-
-    # Create a musical phrase with variation
-    base_freq = 220 + 30 * np.sin(2 * np.pi * 0.3 * t)  # Vibrato
-
-    # Harmonic series
-    signal = (
-        0.5 * np.sin(2 * np.pi * base_freq * t) +
-        0.3 * np.sin(2 * np.pi * base_freq * 2 * t) +
-        0.2 * np.sin(2 * np.pi * base_freq * 3 * t) +
-        0.1 * np.sin(2 * np.pi * base_freq * 4 * t)
-    )
-
-    # Add formant-like characteristics
-    formant1 = 800 + 100 * np.sin(2 * np.pi * 0.4 * t)
-    formant2 = 1200 + 150 * np.sin(2 * np.pi * 0.5 * t)
-    signal += 0.15 * np.sin(2 * np.pi * formant1 * t)
-    signal += 0.1 * np.sin(2 * np.pi * formant2 * t)
-
-    # Envelope
-    attack = 0.1
-    decay = 0.2
-    envelope = np.ones_like(t)
-    attack_samples = int(attack * sample_rate)
-    decay_samples = int(decay * sample_rate)
-    envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
-    envelope[-decay_samples:] = np.linspace(1, 0, decay_samples)
-    signal *= envelope
-
-    # Add slight noise
-    signal += 0.005 * np.random.randn(len(signal))
-
-    # Normalize
-    signal = signal / np.max(np.abs(signal)) * 0.8
-
+    signal = create_fidelity_demo_signal(sample_rate=sample_rate, duration=duration)
     print(f"  Duration: {duration}s, Sample rate: {sample_rate} Hz")
     return signal, sample_rate
 
