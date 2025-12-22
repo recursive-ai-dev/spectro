@@ -129,6 +129,12 @@ class SpectralStateGuidedSynthesis:
     structure from low-level spectral content using HMM and LPC synthesis.
     """
     
+    # Class constants for configuration
+    DEFAULT_BIC_CANDIDATES = [8, 16, 24, 32]
+    WAVELET_VARIANCE_HIGH = 0.1
+    WAVELET_VARIANCE_MED = 0.05
+    EXCITATION_NORMALIZATION_SCALE = 0.5
+    
     def __init__(
         self,
         n_states=34,
@@ -136,21 +142,31 @@ class SpectralStateGuidedSynthesis:
         frame_size=1024,
         hop_size=256,
         smoothness_weight=0.5,
+        auto_n_states=False,
     ):
         """
         Initialize SSGS parameters
         
         Args:
             n_states: Number of HMM states (default: 34 for enhanced generative capabilities)
+                     NOTE: This parameter is ignored when auto_n_states=True. In that case,
+                     the optimal state count will be selected automatically during training.
             lpc_order: Order of Linear Prediction coefficients
             frame_size: Size of analysis frames
             hop_size: Hop size between frames
+            smoothness_weight: Weight for spectral smoothness heuristic
+            auto_n_states: If True, automatically select optimal n_states using BIC.
+                          When enabled, the n_states parameter is ignored and the optimal
+                          value is determined during initialize_hmm_parameters().
         """
+        if auto_n_states:
+            logger.info("auto_n_states enabled: n_states parameter will be determined automatically")
         self.n_states = n_states
         self.lpc_order = lpc_order
         self.frame_size = frame_size
         self.hop_size = hop_size
         self.smoothness_weight = smoothness_weight
+        self.auto_n_states = auto_n_states
         
         # Internal state containers keep responsibilities isolated yet accessible.
         self._params = _ModelParameters()
@@ -947,16 +963,175 @@ class SpectralStateGuidedSynthesis:
         self._compute_and_cache_cholesky_factors()
         self.augmentation_applied = True
 
+    def _compute_hmm_bic(self, n_states, n_em_iterations=3):
+        """
+        Compute Bayesian Information Criterion (BIC) for an HMM with given state count.
+        
+        Args:
+            n_states: Number of states to test
+            n_em_iterations: Number of EM iterations for fitting
+            
+        Returns:
+            bic: BIC score (lower is better)
+        """
+        if self.lpc_coefficients is None:
+            raise ValueError("Must extract features first")
+        
+        num_frames = self.lpc_coefficients.shape[0]
+        
+        # Save current state
+        original_n_states = self.n_states
+        original_params = (
+            self.transition_matrix,
+            self.initial_probabilities,
+            self.state_means,
+            self.state_covariances,
+        )
+        
+        try:
+            # Temporarily set n_states
+            self.n_states = n_states
+            
+            # Initialize HMM with this state count
+            coeff_mean = np.mean(self.lpc_coefficients, axis=0)
+            
+            if (
+                self.perceptual_features is not None
+                and self.perceptual_features.shape[0] == num_frames
+            ):
+                clustering_features = np.hstack([
+                    self.lpc_coefficients,
+                    self.perceptual_features,
+                ])
+            else:
+                clustering_features = self.lpc_coefficients
+            
+            clustering_features = clustering_features.astype(np.float64, copy=False)
+            feature_mean = clustering_features.mean(axis=0)
+            feature_std = clustering_features.std(axis=0) + 1e-6
+            normalized_features = (clustering_features - feature_mean) / feature_std
+            
+            centroids, labels = vq.kmeans2(normalized_features, n_states, minit="++", iter=20)
+            if isinstance(labels, tuple):
+                labels = labels[0]
+            
+            self.initial_probabilities = np.zeros(n_states, dtype=np.float64)
+            self.transition_matrix = np.zeros((n_states, n_states), dtype=np.float64)
+            self.state_means = np.zeros((n_states, self.lpc_order), dtype=np.float64)
+            self.state_covariances = np.array(
+                [np.eye(self.lpc_order, dtype=np.float64) * 0.05 for _ in range(n_states)]
+            )
+            
+            # Initialize parameters from clustering
+            for state in range(n_states):
+                mask = labels == state
+                if not np.any(mask):
+                    self.state_means[state] = coeff_mean
+                    continue
+                state_coeffs = self.lpc_coefficients[mask]
+                self.state_means[state] = state_coeffs.mean(axis=0)
+                centered = state_coeffs - self.state_means[state]
+                cov = np.dot(centered.T, centered) / (len(state_coeffs) - 1 + 1e-9)
+                cov += np.eye(self.lpc_order) * 1e-4
+                self.state_covariances[state] = cov
+            
+            for idx, state in enumerate(labels):
+                if idx == 0:
+                    self.initial_probabilities[state] += 1.0
+                else:
+                    prev_state = labels[idx - 1]
+                    self.transition_matrix[prev_state, state] += 1.0
+            
+            self.initial_probabilities += 1e-3
+            self.initial_probabilities /= self.initial_probabilities.sum()
+            
+            self.transition_matrix += 1e-6
+            row_sums = self.transition_matrix.sum(axis=1, keepdims=True)
+            self.transition_matrix /= row_sums
+            
+            self._reset_caches()
+            self._compute_and_cache_cholesky_factors()
+            
+            # Run a few EM iterations
+            for _ in range(n_em_iterations):
+                gamma, xi, log_likelihood = self._expectation_step(self.lpc_coefficients)
+                self._maximization_step(self.lpc_coefficients, gamma, xi)
+            
+            # Final log-likelihood
+            _, _, log_likelihood = self._expectation_step(self.lpc_coefficients)
+            
+            # Compute number of free parameters
+            # Transition matrix: n_states * (n_states - 1) (rows sum to 1)
+            # Initial probs: n_states - 1 (sum to 1)
+            # State means: n_states * lpc_order
+            # State covariances: n_states * lpc_order * (lpc_order + 1) / 2 (symmetric)
+            n_transition_params = n_states * (n_states - 1)
+            n_init_params = n_states - 1
+            n_mean_params = n_states * self.lpc_order
+            n_cov_params = n_states * self.lpc_order * (self.lpc_order + 1) // 2
+            n_params = n_transition_params + n_init_params + n_mean_params + n_cov_params
+            
+            # BIC = -2 * log_likelihood + k * log(n)
+            bic = -2 * log_likelihood + n_params * np.log(num_frames)
+            
+            return bic
+            
+        finally:
+            # Restore original state
+            self.n_states = original_n_states
+            (
+                self.transition_matrix,
+                self.initial_probabilities,
+                self.state_means,
+                self.state_covariances,
+            ) = original_params
+            self._reset_caches()
+    
+    def _select_optimal_n_states(self, candidate_counts=None):
+        """
+        Select optimal number of states using BIC.
+        
+        Args:
+            candidate_counts: List of state counts to test (default: DEFAULT_BIC_CANDIDATES)
+            
+        Returns:
+            optimal_n_states: Selected state count
+        """
+        if candidate_counts is None:
+            candidate_counts = self.DEFAULT_BIC_CANDIDATES
+        
+        print(f"Auto-selecting n_states from candidates: {candidate_counts}")
+        
+        bic_scores = {}
+        for n in candidate_counts:
+            if n > len(self.lpc_coefficients):
+                print(f"  Skipping n_states={n} (exceeds frame count)")
+                continue
+            print(f"  Testing n_states={n}...", end=" ")
+            bic = self._compute_hmm_bic(n, n_em_iterations=3)
+            bic_scores[n] = bic
+            print(f"BIC={bic:.2f}")
+        
+        optimal_n_states = min(bic_scores, key=bic_scores.get)
+        print(f"Selected optimal n_states={optimal_n_states} (lowest BIC)")
+        
+        return optimal_n_states
+
     def initialize_hmm_parameters(self):
         """
         Phase 1, Step 2: State Initialization using Clustering
         
-        Uses k-means clustering to initialize HMM parameters from LPC coefficients
+        Uses k-means clustering to initialize HMM parameters from LPC coefficients.
+        If auto_n_states=True, automatically selects optimal state count using BIC.
         """
         if self.lpc_coefficients is None:
             raise ValueError("Must extract features first using extract_features()")
 
         self._apply_residual_augmentation()
+        
+        # Auto-select n_states if enabled
+        if self.auto_n_states:
+            self.n_states = self._select_optimal_n_states()
 
         num_frames = self.lpc_coefficients.shape[0]
         if num_frames < self.n_states:
@@ -1509,6 +1684,102 @@ class SpectralStateGuidedSynthesis:
         excitation *= envelope
         return excitation
     
+    def _wavelet_excitation(self, state, duration_samples):
+        """
+        Wavelet-based excitation generation as an alternative to Karplus-Strong.
+        
+        Uses inverse wavelet transform of coefficients derived from the current
+        spectral state to generate excitation signals with different textural
+        characteristics.
+        
+        Args:
+            state: HMM state for parameterization
+            duration_samples: Number of samples to generate
+            
+        Returns:
+            excitation_signal: Wavelet-based excitation signal
+        """
+        try:
+            import pywt
+        except ImportError:
+            raise ImportError(
+                "PyWavelets is required for wavelet excitation. "
+                "Install with: pip install PyWavelets"
+            )
+        
+        mean_coeffs = self.state_means[state]
+        
+        # Select wavelet type based on spectral characteristics
+        spectral_centroid = np.mean(np.abs(mean_coeffs))
+        spectral_variance = np.var(mean_coeffs)
+        
+        # Choose wavelet family based on spectral properties
+        # High variance -> more complex wavelet (db4)
+        # Low variance -> simpler wavelet (haar, db2)
+        if spectral_variance > self.WAVELET_VARIANCE_HIGH:
+            wavelet_name = 'db4'  # Daubechies 4
+        elif spectral_variance > self.WAVELET_VARIANCE_MED:
+            wavelet_name = 'db2'  # Daubechies 2
+        else:
+            wavelet_name = 'haar'  # Simplest
+        
+        # Determine decomposition level based on duration
+        max_level = pywt.dwt_max_level(duration_samples, wavelet_name)
+        decomp_level = min(max_level, 4)  # Cap at 4 levels
+        
+        # Generate wavelet coefficients from spectral state
+        # Use LPC coefficients to modulate wavelet structure
+        rng = np.random.default_rng()
+        
+        # Create wavelet packet with state-dependent characteristics
+        # Detail coefficients (high frequency) influenced by LPC magnitude
+        detail_scale = float(np.linalg.norm(mean_coeffs))
+        
+        # Approximation coefficients (low frequency) influenced by spectral centroid
+        approx_scale = float(1.0 + spectral_centroid)
+        
+        # Generate base signal with controlled randomness
+        base_length = duration_samples
+        base_signal = rng.standard_normal(base_length).astype(np.float32)
+        
+        # Decompose signal
+        coeffs = pywt.wavedec(base_signal, wavelet_name, level=decomp_level)
+        
+        # Modulate coefficients based on spectral state
+        # Approximation coefficients (lowest frequency)
+        coeffs[0] = coeffs[0] * approx_scale * 0.5
+        
+        # Detail coefficients (higher frequencies)
+        for i in range(1, len(coeffs)):
+            # Scale detail coefficients by LPC-derived values
+            if i <= len(mean_coeffs):
+                scale_factor = float(np.abs(mean_coeffs[i-1]) * detail_scale)
+            else:
+                scale_factor = detail_scale * 0.5
+            coeffs[i] = coeffs[i] * scale_factor * 0.3
+        
+        # Reconstruct signal from modified coefficients
+        excitation = pywt.waverec(coeffs, wavelet_name)
+        
+        # Ensure correct length
+        if len(excitation) > duration_samples:
+            excitation = excitation[:duration_samples]
+        elif len(excitation) < duration_samples:
+            excitation = np.pad(excitation, (0, duration_samples - len(excitation)), mode='constant')
+        
+        excitation = excitation.astype(np.float32)
+        
+        # Apply envelope for natural attack/decay
+        envelope = np.exp(-np.linspace(0, 3, duration_samples)).astype(np.float32)
+        excitation *= envelope
+        
+        # Normalize
+        max_val = np.max(np.abs(excitation))
+        if max_val > 0:
+            excitation = excitation / max_val * self.EXCITATION_NORMALIZATION_SCALE
+        
+        return excitation
+    
     def _lpc_synthesis_filter(self, excitation, lpc_coeffs):
         """
         Phase 2, Step 7: Audio Synthesis using LPC filtering
@@ -1683,7 +1954,7 @@ class SpectralStateGuidedSynthesis:
         preview = self._apply_gain_floor(preview, minimum_peak=0.75, target_peak=0.9)
         return preview.astype(np.float32), sample_rate
     
-    def synthesize_audio(self, target_duration_seconds, sample_rate=16000, fidelity=0.0):
+    def synthesize_audio(self, target_duration_seconds, sample_rate=16000, fidelity=0.0, excitation_type='Karplus-Strong'):
         """
         Phase 2: Complete Audio Synthesis Pipeline
 
@@ -1691,9 +1962,11 @@ class SpectralStateGuidedSynthesis:
             target_duration_seconds: Target duration in seconds
             sample_rate: Output sample rate
             fidelity: Reconstruction fidelity (0.0-1.0)
-                     0.0 = fully synthetic (Karplus-Strong excitation)
+                     0.0 = fully synthetic (uses excitation_type)
                      1.0 = high fidelity reconstruction (training residuals)
                      Values in between blend both approaches
+            excitation_type: Type of excitation for synthesis ('Karplus-Strong' or 'Wavelet')
+                           Only used when fidelity < 1.0
 
         Returns:
             audio_output: Generated audio signal
@@ -1703,10 +1976,15 @@ class SpectralStateGuidedSynthesis:
 
         if not 0.0 <= fidelity <= 1.0:
             raise ValueError("fidelity must be between 0.0 and 1.0")
+        
+        if excitation_type not in ['Karplus-Strong', 'Wavelet']:
+            raise ValueError("excitation_type must be 'Karplus-Strong' or 'Wavelet'")
 
         target_frames = int(target_duration_seconds * sample_rate / self.hop_size)
         print(f"Synthesizing {target_duration_seconds}s of audio ({target_frames} frames)")
         print(f"Fidelity: {fidelity:.2f} (0.0=synthetic, 1.0=reconstruction)")
+        if fidelity < 1.0:
+            print(f"Excitation type: {excitation_type}")
 
         # Step 5: Decode optimal state sequence using A* search
         print("Step 5: Decoding state sequence with A* search...")
@@ -1721,12 +1999,18 @@ class SpectralStateGuidedSynthesis:
                 # Pure reconstruction mode: use training residuals only
                 excitation = self._get_training_residual_for_state(state, rng)
             elif fidelity <= 0.0:
-                # Pure synthetic mode: use Karplus-Strong only
-                excitation = self._karplus_strong_excitation(state, self.hop_size)
+                # Pure synthetic mode: use selected excitation type
+                if excitation_type == 'Karplus-Strong':
+                    excitation = self._karplus_strong_excitation(state, self.hop_size)
+                else:  # Wavelet
+                    excitation = self._wavelet_excitation(state, self.hop_size)
             else:
                 # Blend mode: mix both approaches
                 residual_excitation = self._get_training_residual_for_state(state, rng)
-                synthetic_excitation = self._karplus_strong_excitation(state, self.hop_size)
+                if excitation_type == 'Karplus-Strong':
+                    synthetic_excitation = self._karplus_strong_excitation(state, self.hop_size)
+                else:  # Wavelet
+                    synthetic_excitation = self._wavelet_excitation(state, self.hop_size)
                 # Linear blend based on fidelity parameter
                 excitation = (fidelity * residual_excitation +
                             (1.0 - fidelity) * synthetic_excitation)
@@ -1880,6 +2164,92 @@ class SpectralStateGuidedSynthesis:
         model._transition_cost_matrix()
         return model
 
+    def _extract_features_from_files(self, audio_files, sample_rate=16000):
+        """
+        Extract features from multiple audio files and concatenate them.
+        
+        Args:
+            audio_files: List of file paths or audio signal arrays
+            sample_rate: Sampling rate (used if loading from files)
+            
+        Returns:
+            None (sets internal state)
+        """
+        all_frames = []
+        all_lpc_coefficients = []
+        all_residual_signals = []
+        all_perceptual_features = []
+        all_spectral_flux = []
+        
+        for idx, audio_input in enumerate(audio_files):
+            print(f"  Processing file {idx + 1}/{len(audio_files)}...")
+            
+            # Load audio if it's a file path
+            if isinstance(audio_input, (str, Path)):
+                try:
+                    import soundfile as sf
+                    audio_signal, file_sr = sf.read(audio_input)
+                    if audio_signal.ndim > 1:
+                        # Convert to mono if stereo
+                        audio_signal = audio_signal.mean(axis=1)
+                    # Resample if needed
+                    if file_sr != sample_rate:
+                        from scipy.signal import resample
+                        num_samples = int(len(audio_signal) * sample_rate / file_sr)
+                        audio_signal = resample(audio_signal, num_samples)
+                    audio_signal = audio_signal.astype(np.float32)
+                except Exception as e:
+                    raise ValueError(f"Failed to load audio file {audio_input}: {e}")
+            else:
+                # Already an array
+                audio_signal = np.asarray(audio_input, dtype=np.float32)
+            
+            # Extract features for this file
+            frames = self._frame_signal(audio_signal)
+            
+            mel_filters = self._mel_filter_bank(sample_rate, self.frame_size)
+            erb_filters = self._erb_filter_bank(sample_rate, self.frame_size)
+            window = np.hanning(self.frame_size).astype(np.float32)
+            
+            (
+                processed_frames,
+                lpc_coeffs,
+                residuals,
+                perceptual_vectors,
+                flux_values,
+            ) = self._process_frame_batch(frames, mel_filters, erb_filters, window)
+            
+            if processed_frames.size > 0:
+                all_frames.append(processed_frames)
+                all_lpc_coefficients.append(lpc_coeffs)
+                all_residual_signals.append(residuals)
+                all_perceptual_features.append(perceptual_vectors)
+                all_spectral_flux.append(flux_values)
+                print(f"    Extracted {len(lpc_coeffs)} frames")
+        
+        if not all_frames:
+            raise ValueError("No valid frames extracted from any files")
+        
+        # Concatenate all features while preserving temporal order within each file
+        self.training_frames = np.concatenate(all_frames, axis=0)
+        self.lpc_coefficients = np.concatenate(all_lpc_coefficients, axis=0)
+        self.residual_signals = np.concatenate(all_residual_signals, axis=0)
+        self.perceptual_features = np.concatenate(all_perceptual_features, axis=0)
+        self.spectral_flux = np.concatenate(all_spectral_flux, axis=0)
+        self.sample_rate = int(sample_rate)
+        
+        print(f"  Total extracted: {len(self.lpc_coefficients)} frames from {len(audio_files)} files")
+        
+        # Compute metadata for combined features
+        self._compute_frame_metadata(self.sample_rate)
+        if self.spectral_flux is not None and self.spectral_flux.size:
+            metadata = self.frame_metadata
+            metadata["spectral_flux"] = self.spectral_flux
+            self.frame_metadata = metadata
+        
+        self._reset_caches()
+        self._compute_and_cache_cholesky_factors()
+
     def train(
         self,
         audio_signal,
@@ -1894,7 +2264,7 @@ class SpectralStateGuidedSynthesis:
         Complete training pipeline
         
         Args:
-            audio_signal: Training audio signal
+            audio_signal: Training audio signal (single array) or list of audio signals/file paths
             sample_rate: Sampling rate
             n_em_iterations: Number of EM iterations
             preview_every: Forward previews every N EM iterations (0 disables)
@@ -1906,8 +2276,15 @@ class SpectralStateGuidedSynthesis:
         
         # Step 1: Feature Extraction
         print("Step 1: Extracting features (LPC analysis)...")
-        self.extract_features(audio_signal, sample_rate)
-        print(f"Extracted {len(self.lpc_coefficients)} frames of LPC coefficients")
+        
+        # Check if we have multiple files/signals
+        if isinstance(audio_signal, (list, tuple)):
+            print(f"Batch mode: Training on {len(audio_signal)} audio files/signals")
+            self._extract_features_from_files(audio_signal, sample_rate)
+        else:
+            # Single signal
+            self.extract_features(audio_signal, sample_rate)
+            print(f"Extracted {len(self.lpc_coefficients)} frames of LPC coefficients")
         
         # Step 2: State Initialization
         print("Step 2: Initializing HMM parameters...")
@@ -1928,7 +2305,7 @@ class SpectralStateGuidedSynthesis:
         
         print("Training complete!")
     
-    def generate(self, duration_seconds, sample_rate=16000, fidelity=0.0):
+    def generate(self, duration_seconds, sample_rate=16000, fidelity=0.0, excitation_type='Karplus-Strong'):
         """
         Generate new audio
 
@@ -1939,6 +2316,7 @@ class SpectralStateGuidedSynthesis:
                      0.0 = fully synthetic/novel generation
                      1.0 = high fidelity reconstruction of training audio
                      0.5 = balanced mix showing variance
+            excitation_type: Type of excitation ('Karplus-Strong' or 'Wavelet')
 
         Returns:
             Generated audio signal
@@ -1946,7 +2324,7 @@ class SpectralStateGuidedSynthesis:
         print("Phase 2: Inference (Audio Generation)")
         print("=" * 50)
 
-        return self.synthesize_audio(duration_seconds, sample_rate, fidelity=fidelity)
+        return self.synthesize_audio(duration_seconds, sample_rate, fidelity=fidelity, excitation_type=excitation_type)
 
 
 def example_usage():
