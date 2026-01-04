@@ -47,13 +47,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def find_audio_files(folders: List[str], extensions: Optional[List[str]] = None) -> List[Path]:
+def find_audio_files(
+    folders: List[str],
+    extensions: Optional[List[str]] = None,
+    recursive: bool = False,
+) -> List[Path]:
     """
     Find all audio files in specified folders.
     
     Args:
         folders: List of folder paths to search
         extensions: List of file extensions to include (default: ['.mp3', '.wav', '.flac', '.ogg'])
+        recursive: Whether to search recursively through subdirectories
         
     Returns:
         List of Path objects for found audio files
@@ -74,7 +79,8 @@ def find_audio_files(folders: List[str], extensions: Optional[List[str]] = None)
         
         # Find all audio files in the folder
         for ext in extensions:
-            found = list(folder.glob(f"*{ext}"))
+            pattern = f"*{ext}"
+            found = list(folder.rglob(pattern) if recursive else folder.glob(pattern))
             audio_files.extend(found)
             logger.info(f"Found {len(found)} {ext} files in {folder}")
     
@@ -106,6 +112,11 @@ def train_model(
     Returns:
         Trained SSGS model
     """
+    if not audio_files:
+        raise ValueError(
+            "No audio files provided for training. "
+            "Check folder paths, extensions, or enable recursive search."
+        )
     if checkpoint_dir is None:
         checkpoint_dir = Path("models")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -243,15 +254,27 @@ def main():
         default=[".mp3", ".wav", ".flac", ".ogg"],
         help="Audio file extensions to process (default: .mp3 .wav .flac .ogg)"
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Search for audio files recursively within folders",
+    )
     
     args = parser.parse_args()
     
     # Find audio files
     logger.info("Searching for audio files...")
-    audio_files = find_audio_files(args.folders, args.extensions)
+    audio_files = find_audio_files(
+        args.folders,
+        args.extensions,
+        recursive=args.recursive,
+    )
     
     if not audio_files:
-        logger.error("No audio files found! Please check folder paths and extensions.")
+        logger.error(
+            "No audio files found! Please check folder paths, extensions, "
+            "or enable recursive search."
+        )
         return 1
     
     logger.info(f"Found {len(audio_files)} audio files")

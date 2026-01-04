@@ -4,19 +4,20 @@ import pytest
 from ssgs import SpectralStateGuidedSynthesis
 
 
-def _test_signal(sample_rate=8000, duration=0.5):
+def _test_signal(sample_rate=8000, duration=0.5, seed=800):
+    rng = np.random.default_rng(seed)
     t = np.linspace(0.0, duration, int(sample_rate * duration), endpoint=False)
     # Stack a few harmonics to give LPC something meaningful
     signal = 0.6 * np.sin(2 * np.pi * 220 * t)
     signal += 0.3 * np.sin(2 * np.pi * 330 * t)
     signal += 0.2 * np.sin(2 * np.pi * 440 * t)
-    signal += 0.05 * np.random.randn(len(t))
+    signal += 0.05 * rng.standard_normal(len(t))
     return signal
 
 
 def test_frame_metadata_and_indexing_round_trip():
     sample_rate = 8000
-    signal = _test_signal(sample_rate=sample_rate)
+    signal = _test_signal(sample_rate=sample_rate, seed=801)
 
     model = SpectralStateGuidedSynthesis(
         n_states=6,
@@ -79,7 +80,7 @@ def test_frame_metadata_and_indexing_round_trip():
 
 def test_frame_metadata_export_import(tmp_path):
     sample_rate = 8000
-    signal = _test_signal(sample_rate=sample_rate)
+    signal = _test_signal(sample_rate=sample_rate, seed=802)
 
     model = SpectralStateGuidedSynthesis(n_states=4, lpc_order=8, frame_size=256, hop_size=64)
     model.extract_features(signal, sample_rate)
@@ -97,3 +98,11 @@ def test_frame_metadata_export_import(tmp_path):
 
     restored_index = restored.build_feature_index("lpc")
     assert restored_index.tree.n == model.lpc_coefficients.shape[0]
+
+
+def test_initialize_hmm_parameters_requires_frames():
+    model = SpectralStateGuidedSynthesis(n_states=4, lpc_order=8, frame_size=256, hop_size=64)
+    model.lpc_coefficients = np.empty((0, model.lpc_order), dtype=np.float64)
+
+    with pytest.raises(ValueError, match="No frames extracted"):
+        model.initialize_hmm_parameters()

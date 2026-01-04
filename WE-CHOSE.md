@@ -68,3 +68,37 @@ We selected the blended adaptive-statistics path because it satisfies all three 
 
 ## Decision Summary
 We updated the README to reduce ambiguity, reflect real entry points, and preserve the operational path from training to persistence.
+
+---
+
+# Production Hardening — Perspective Mapping
+
+### CEO Perspective (Reliability + Risk Reduction)
+**Goal:** Prevent production failures from invalid inputs or corrupted checkpoints.
+
+**Choice:** Enforce strict validation of required checkpoint tensors and add early guards for empty training frames.
+- **Mapping:** LOGIC-MAP Production Chain A and B.
+- **Why:** Deterministic failure modes reduce operational risk and support predictable recovery workflows.
+
+---
+
+### Junior Developer Perspective (Debuggability + Test Stability)
+**Goal:** Make test outcomes repeatable and errors actionable.
+
+**Choice:** Add seeded RNG support in `test_utils` and update tests to use fixed seeds instead of global RNG state.
+- **Mapping:** LOGIC-MAP Production Chain C.
+- **Why:** Deterministic signals isolate regressions and allow direct comparison of spectral statistics across runs.
+
+---
+
+### End-Customer Perspective (Trust + Usability)
+**Goal:** Provide clear feedback when inputs are invalid and preserve confidence in exported models.
+
+**Choice:** Explicit error messages for empty inputs and missing checkpoint tensors, plus improved training file discovery warnings.
+- **Mapping:** LOGIC-MAP Production Chain A and B.
+- **Why:** Clear failure reasons shorten support cycles and improve user trust in the model pipeline.
+
+---
+
+## Decision Summary
+We chose strict validation and deterministic test signals because they simultaneously improve operational reliability, developer productivity, and end-user confidence.

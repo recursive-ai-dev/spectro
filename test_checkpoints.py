@@ -37,7 +37,7 @@ def test_checkpoint_save_load():
     print("\n1. Creating and training model...")
     sample_rate = 16000
     duration = 1.0
-    signal = create_test_signal(duration, sample_rate)
+    signal = create_test_signal(sample_rate=sample_rate, duration=duration, seed=401)
     
     ssgs = SpectralStateGuidedSynthesis(
         n_states=8,  # Small for fast testing
@@ -133,7 +133,7 @@ def test_checkpoint_without_training_artifacts():
     
     sample_rate = 16000
     duration = 0.5
-    signal = create_test_signal(duration, sample_rate)
+    signal = create_test_signal(sample_rate=sample_rate, duration=duration, seed=402)
     
     print("\n1. Training model...")
     ssgs = SpectralStateGuidedSynthesis(n_states=8, lpc_order=12)
@@ -174,7 +174,7 @@ def test_checkpoint_file_format():
     print("=" * 60)
     
     sample_rate = 16000
-    signal = create_test_signal(0.5, sample_rate)
+    signal = create_test_signal(sample_rate=sample_rate, duration=0.5, seed=403)
     
     print("\n1. Creating model...")
     ssgs = SpectralStateGuidedSynthesis(n_states=8, lpc_order=12)
@@ -228,6 +228,55 @@ def test_checkpoint_file_format():
     print("=" * 60)
 
 
+def test_checkpoint_missing_required_tensor():
+    """Verify missing tensors are rejected with descriptive errors."""
+    print("\n" + "=" * 60)
+    print("Test: Missing Required Tensor Handling")
+    print("=" * 60)
+
+    try:
+        from safetensors.numpy import save_file
+    except ImportError:
+        print("   ⚠️ safetensors not installed; skipping missing tensor test")
+        return
+
+    transition = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    initial = np.array([0.5, 0.5], dtype=np.float32)
+    means = np.zeros((2, 4), dtype=np.float32)
+
+    metadata = {
+        "format": "safetensors",
+        "version": "1",
+        "n_states": "2",
+        "lpc_order": "4",
+        "frame_size": "16",
+        "hop_size": "4",
+        "smoothness_weight": "0.5",
+        "adaptive_memory_limit": "6000",
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkpoint_path = Path(tmpdir) / "missing_tensor.safetensors"
+        tensors = {
+            "transition_matrix": transition,
+            "initial_probabilities": initial,
+            "state_means": means,
+        }
+        save_file(tensors, checkpoint_path, metadata=metadata)
+
+        try:
+            SpectralStateGuidedSynthesis.load_checkpoint(checkpoint_path)
+        except ValueError as exc:
+            if "state_covariances" not in str(exc):
+                raise AssertionError(
+                    "Missing tensor error did not mention state_covariances"
+                ) from exc
+        else:
+            raise AssertionError("Expected ValueError for missing tensor")
+
+    print("   ✓ Missing tensor validation passed")
+
+
 def run_all_tests():
     """Run all checkpoint tests."""
     print("\n" + "=" * 60)
@@ -238,6 +287,7 @@ def run_all_tests():
         test_checkpoint_save_load()
         test_checkpoint_without_training_artifacts()
         test_checkpoint_file_format()
+        test_checkpoint_missing_required_tensor()
         
         print("\n" + "=" * 60)
         print("ALL TESTS PASSED ✓")

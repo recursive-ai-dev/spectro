@@ -19,8 +19,9 @@ import matplotlib.pyplot as plt
 import soundfile as sf
 from ssgs import SpectralStateGuidedSynthesis
 from test_utils import create_test_signal
-import warnings
-warnings.filterwarnings('ignore')
+
+def _rng(seed):
+    return np.random.default_rng(seed)
 
 def analyze_and_plot_results(ssgs, original_signal, generated_signal, sample_rate=16000):
     """
@@ -181,7 +182,7 @@ def run_comprehensive_test():
     
     # Step 1: Create training signal
     print("Step 1: Creating complex training signal...")
-    original_signal = create_test_signal(sample_rate, training_duration)
+    original_signal = create_test_signal(sample_rate, training_duration, seed=331)
     print(f"  Created signal with {len(original_signal)} samples")
     print(f"  Signal RMS: {np.sqrt(np.mean(original_signal**2)):.4f}")
     
@@ -269,7 +270,8 @@ def test_astar_vs_viterbi_decoding():
     ])
     
     # Add noise to make decoding challenging
-    signal += 0.1 * np.random.randn(len(signal))
+    rng = _rng(270)
+    signal += 0.1 * rng.standard_normal(len(signal))
     
     # Initialize and train model
     ssgs = SpectralStateGuidedSynthesis(
@@ -377,7 +379,8 @@ def test_state_pruning_and_renormalization():
     sample_rate = 16000
     duration = 1.0
     t = np.linspace(0, duration, int(sample_rate * duration))
-    signal = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * np.random.randn(len(t))
+    rng = _rng(378)
+    signal = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * rng.standard_normal(len(t))
     
     # Test with n_states=42 as specified in the problem
     n_states = 42
@@ -451,7 +454,8 @@ def test_model_export_import_integrity():
     sample_rate = 16000
     duration = 1.0
     t = np.linspace(0, duration, int(sample_rate * duration))
-    signal = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * np.random.randn(len(t))
+    rng = _rng(452)
+    signal = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * rng.standard_normal(len(t))
     
     original_model = SpectralStateGuidedSynthesis(
         n_states=10,
@@ -530,11 +534,8 @@ def test_model_export_import_integrity():
         
         # Test synthesis with both models to ensure functional equivalence
         print("\nTesting functional equivalence...")
-        np.random.seed(42)
-        audio1 = original_model.generate(0.5, sample_rate, fidelity=0.0)
-        
-        np.random.seed(42)
-        audio2 = loaded_model.generate(0.5, sample_rate, fidelity=0.0)
+        audio1 = original_model.generate(0.5, sample_rate, fidelity=0.0, seed=42)
+        audio2 = loaded_model.generate(0.5, sample_rate, fidelity=0.0, seed=42)
         
         # Audio should be very similar (not identical due to random excitation, but structure similar)
         correlation = np.corrcoef(audio1, audio2)[0, 1]
@@ -562,15 +563,18 @@ def test_batch_training():
     t = np.linspace(0, duration, int(sample_rate * duration))
     
     # Signal 1: Low frequency
-    signal1 = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * np.random.randn(len(t))
+    rng = _rng(563)
+    signal1 = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * rng.standard_normal(len(t))
     print("Created signal 1: Low frequency (220 Hz)")
     
     # Signal 2: Mid frequency
-    signal2 = 0.5 * np.sin(2 * np.pi * 440 * t) + 0.05 * np.random.randn(len(t))
+    rng = _rng(567)
+    signal2 = 0.5 * np.sin(2 * np.pi * 440 * t) + 0.05 * rng.standard_normal(len(t))
     print("Created signal 2: Mid frequency (440 Hz)")
     
     # Signal 3: High frequency
-    signal3 = 0.5 * np.sin(2 * np.pi * 660 * t) + 0.05 * np.random.randn(len(t))
+    rng = _rng(571)
+    signal3 = 0.5 * np.sin(2 * np.pi * 660 * t) + 0.05 * rng.standard_normal(len(t))
     print("Created signal 3: High frequency (660 Hz)")
     
     # Test batch training with list of signals
@@ -659,7 +663,8 @@ def test_wavelet_excitation():
     sample_rate = 16000
     duration = 1.0
     t = np.linspace(0, duration, int(sample_rate * duration))
-    signal = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * np.random.randn(len(t))
+    rng = _rng(660)
+    signal = 0.5 * np.sin(2 * np.pi * 220 * t) + 0.05 * rng.standard_normal(len(t))
     
     ssgs = SpectralStateGuidedSynthesis(
         n_states=8,
@@ -727,7 +732,8 @@ def test_auto_n_states_selection():
         0.5 * np.sin(2 * np.pi * 440 * t[:len(t)//3]),
         0.5 * np.sin(2 * np.pi * 660 * t[:len(t)//3]),
     ])
-    signal += 0.05 * np.random.randn(len(signal))
+    rng = _rng(728)
+    signal += 0.05 * rng.standard_normal(len(signal))
     
     # Test with auto_n_states=True
     print("\nTesting auto_n_states=True...")
