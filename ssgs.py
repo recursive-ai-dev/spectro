@@ -134,6 +134,10 @@ class SpectralStateGuidedSynthesis:
     WAVELET_VARIANCE_HIGH = 0.1
     WAVELET_VARIANCE_MED = 0.05
     EXCITATION_NORMALIZATION_SCALE = 0.5
+    # Minimum eigenvalue threshold for positive definite covariance matrices
+    # after loading from checkpoints (precision loss during save/load)
+    COVARIANCE_MIN_EIGENVALUE = 1e-4
+    COVARIANCE_REGULARIZATION_EPSILON = 1e-5
     
     def __init__(
         self,
@@ -2246,6 +2250,7 @@ class SpectralStateGuidedSynthesis:
         
         # Prepare metadata as a JSON string stored as bytes
         # Note: safetensors metadata values must be strings
+        import json
         metadata = {
             "format": "safetensors",
             "version": "1",
@@ -2257,7 +2262,7 @@ class SpectralStateGuidedSynthesis:
             "precision": target_dtype.name,
             "includes_training_artifacts": str(include_training_artifacts),
             "sample_rate": str(self.sample_rate) if self.sample_rate is not None else "None",
-            "frame_metadata_keys": str(list(self.frame_metadata.keys()) if self.frame_metadata else []),
+            "frame_metadata_keys": json.dumps(list(self.frame_metadata.keys()) if self.frame_metadata else []),
         }
         
         # Save with metadata
@@ -2330,8 +2335,9 @@ class SpectralStateGuidedSynthesis:
             cov = model.state_covariances[state]
             # Add small regularization to ensure positive definiteness
             min_eig = np.min(np.linalg.eigvalsh(cov))
-            if min_eig < 1e-4:
-                model.state_covariances[state] = cov + np.eye(model.lpc_order) * (1e-4 - min_eig + 1e-5)
+            if min_eig < cls.COVARIANCE_MIN_EIGENVALUE:
+                regularization = cls.COVARIANCE_MIN_EIGENVALUE - min_eig + cls.COVARIANCE_REGULARIZATION_EPSILON
+                model.state_covariances[state] = cov + np.eye(model.lpc_order) * regularization
         
         # Load training artifacts if present
         if "training_frames" in tensors:
@@ -2347,14 +2353,11 @@ class SpectralStateGuidedSynthesis:
         
         # Load frame metadata
         meta_keys_str = metadata.get("frame_metadata_keys", "[]")
-        # Parse the string representation of the list
-        import ast
+        # Parse the JSON string
+        import json
         try:
-            if isinstance(meta_keys_str, str):
-                meta_keys = ast.literal_eval(meta_keys_str)
-            else:
-                meta_keys = meta_keys_str
-        except (ValueError, SyntaxError):
+            meta_keys = json.loads(meta_keys_str)
+        except (ValueError, json.JSONDecodeError):
             meta_keys = []
         
         if meta_keys:
@@ -2379,7 +2382,7 @@ class SpectralStateGuidedSynthesis:
         logger.info(f"Checkpoint loaded from {filepath}")
         return model
 
-    def _extract_features_from_files(self, audio_files, sample_rate=16000):
+    def extract_features_from_files(self, audio_files, sample_rate=16000):
         """
         Extract features from multiple audio files and concatenate them.
         

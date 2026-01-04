@@ -134,7 +134,7 @@ def train_model(
         audio_file_strs = [str(f) for f in audio_files]
         
         # Extract features from all files
-        ssgs._extract_features_from_files(audio_file_strs, sample_rate)
+        ssgs.extract_features_from_files(audio_file_strs, sample_rate)
         logger.info(f"Total frames extracted: {len(ssgs.lpc_coefficients)}")
         
         # Initialize HMM parameters
