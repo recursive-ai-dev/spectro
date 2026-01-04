@@ -19,6 +19,7 @@ import json
 import logging
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -27,7 +28,7 @@ import numpy as np
 # Configure module logger
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from scipy import signal
 from scipy.cluster import vq
@@ -122,6 +123,17 @@ class _ComputationCaches:
         self.state_assignments = None
 
 
+@dataclass
+class _AdaptiveStatistics:
+    state_frame_counts: np.ndarray
+    transition_counts: np.ndarray
+    mean_accumulator: np.ndarray
+    second_moment_accumulator: np.ndarray
+    initial_counts: np.ndarray
+    total_frames: float
+    last_adaptation: Optional[str] = None
+
+
 class SpectralStateGuidedSynthesis:
     """
     Spectral-State Guided Synthesis (SSGS) Algorithm
@@ -147,6 +159,7 @@ class SpectralStateGuidedSynthesis:
         hop_size=256,
         smoothness_weight=0.5,
         auto_n_states=False,
+        adaptive_memory_limit=6000,
     ):
         """
         Initialize SSGS parameters
@@ -171,6 +184,7 @@ class SpectralStateGuidedSynthesis:
         self.hop_size = hop_size
         self.smoothness_weight = smoothness_weight
         self.auto_n_states = auto_n_states
+        self.adaptive_memory_limit = int(adaptive_memory_limit)
         
         # Internal state containers keep responsibilities isolated yet accessible.
         self._params = _ModelParameters()
@@ -178,6 +192,7 @@ class SpectralStateGuidedSynthesis:
         self._caches = _ComputationCaches()
         self._feature_indexes: Dict[Tuple[str, bool], FeatureIndex] = {}
         self._max_preview_snapshots = 6
+        self._adaptive_stats: Optional[_AdaptiveStatistics] = None
 
     # ------------------------------------------------------------------
     # Low-level helpers
@@ -881,6 +896,44 @@ class SpectralStateGuidedSynthesis:
         self._reset_caches()
         self._compute_and_cache_cholesky_factors()
         return self.lpc_coefficients, self.residual_signals
+
+    def _extract_features_for_adaptation(self, audio_signal, sample_rate):
+        """Extract features from new audio without overwriting existing training buffers."""
+        frames = self._frame_signal(audio_signal)
+
+        mel_filters = self._mel_filter_bank(sample_rate, self.frame_size)
+        erb_filters = self._erb_filter_bank(sample_rate, self.frame_size)
+        window = np.hanning(self.frame_size).astype(np.float32)
+
+        (
+            processed_frames,
+            lpc_coeffs,
+            residuals,
+            perceptual_vectors,
+            flux_values,
+        ) = self._process_frame_batch(frames, mel_filters, erb_filters, window)
+
+        if lpc_coeffs.size == 0:
+            raise ValueError("No valid frames extracted from adaptation audio")
+
+        frame_metadata = {}
+        if processed_frames.size:
+            frame_len = processed_frames.shape[1]
+            energy = np.sum(processed_frames * processed_frames, axis=1)
+            rms = np.sqrt(energy / frame_len)
+            zero_crossings = np.count_nonzero(
+                np.signbit(processed_frames[:, :-1]) != np.signbit(processed_frames[:, 1:]),
+                axis=1,
+            )
+            frame_metadata = {
+                "energy": energy.astype(np.float32, copy=False),
+                "rms": rms.astype(np.float32, copy=False),
+                "zero_crossings": zero_crossings.astype(np.int32, copy=False),
+            }
+            if flux_values.size:
+                frame_metadata["spectral_flux"] = flux_values.astype(np.float32, copy=False)
+
+        return processed_frames, lpc_coeffs, residuals, perceptual_vectors, flux_values, frame_metadata
     
     def _apply_residual_augmentation(self):
         if self.augmentation_applied:
@@ -1214,6 +1267,245 @@ class SpectralStateGuidedSynthesis:
         self._caches.training_history.clear()
         self._compute_and_cache_cholesky_factors()
         self._transition_cost_matrix()
+
+    def _validate_adaptation_inputs(
+        self,
+        adaptation_rate: float,
+        stability_bias: float,
+        memory_blend: float,
+        memory_limit: int,
+    ) -> None:
+        if not 0.0 <= adaptation_rate <= 1.0:
+            raise ValueError("adaptation_rate must be between 0.0 and 1.0")
+        if not 0.0 <= stability_bias <= 1.0:
+            raise ValueError("stability_bias must be between 0.0 and 1.0")
+        if not 0.0 <= memory_blend <= 1.0:
+            raise ValueError("memory_blend must be between 0.0 and 1.0")
+        if memory_limit <= 0:
+            raise ValueError("memory_limit must be > 0")
+
+    def _compute_statistics_from_observations(self, observations, gamma, xi):
+        counts = gamma.sum(axis=0)
+        mean_accumulator = gamma.T @ observations
+        second_moment = np.zeros(
+            (self.n_states, self.lpc_order, self.lpc_order),
+            dtype=np.float64,
+        )
+        for state in range(self.n_states):
+            weights = gamma[:, state][:, None]
+            weighted = observations * weights
+            second_moment[state] = weighted.T @ observations
+        transition_counts = xi.sum(axis=0)
+        initial_counts = gamma[0].copy()
+        total_frames = float(observations.shape[0])
+        return counts, transition_counts, mean_accumulator, second_moment, initial_counts, total_frames
+
+    def _bootstrap_adaptive_statistics(self):
+        if self.lpc_coefficients is None or self.lpc_coefficients.size == 0:
+            counts = np.ones(self.n_states, dtype=np.float64)
+            transition_counts = np.ones((self.n_states, self.n_states), dtype=np.float64)
+            mean_accumulator = self.state_means.astype(np.float64, copy=False)
+            mean_accumulator = mean_accumulator * counts[:, None]
+            second_moment = np.zeros(
+                (self.n_states, self.lpc_order, self.lpc_order),
+                dtype=np.float64,
+            )
+            for state in range(self.n_states):
+                mean = self.state_means[state]
+                cov = self.state_covariances[state]
+                second_moment[state] = cov + np.outer(mean, mean)
+            initial_counts = self.initial_probabilities.astype(np.float64, copy=True)
+            total_frames = float(self.n_states)
+        else:
+            gamma, xi, _ = self._expectation_step(self.lpc_coefficients)
+            (
+                counts,
+                transition_counts,
+                mean_accumulator,
+                second_moment,
+                initial_counts,
+                total_frames,
+            ) = self._compute_statistics_from_observations(self.lpc_coefficients, gamma, xi)
+
+        self._adaptive_stats = _AdaptiveStatistics(
+            state_frame_counts=counts,
+            transition_counts=transition_counts,
+            mean_accumulator=mean_accumulator,
+            second_moment_accumulator=second_moment,
+            initial_counts=initial_counts,
+            total_frames=total_frames,
+            last_adaptation=None,
+        )
+
+    def _update_adaptive_statistics(
+        self,
+        observations,
+        gamma,
+        xi,
+        *,
+        adaptation_rate: float,
+        stability_bias: float,
+    ) -> None:
+        if self._adaptive_stats is None:
+            self._bootstrap_adaptive_statistics()
+
+        (
+            new_counts,
+            new_transition,
+            new_mean_acc,
+            new_second_moment,
+            new_initial,
+            new_total,
+        ) = self._compute_statistics_from_observations(observations, gamma, xi)
+
+        stats = self._adaptive_stats
+        decay = float(adaptation_rate)
+        retain = 1.0 - decay
+
+        stats.state_frame_counts = retain * stats.state_frame_counts + decay * new_counts
+        stats.transition_counts = retain * stats.transition_counts + decay * new_transition
+        stats.mean_accumulator = retain * stats.mean_accumulator + decay * new_mean_acc
+        stats.second_moment_accumulator = (
+            retain * stats.second_moment_accumulator + decay * new_second_moment
+        )
+        stats.initial_counts = retain * stats.initial_counts + decay * new_initial
+        stats.total_frames = retain * stats.total_frames + decay * new_total
+
+        stats.state_frame_counts += stability_bias
+        stats.transition_counts += stability_bias
+        stats.initial_counts += stability_bias
+        stats.last_adaptation = datetime.utcnow().isoformat() + "Z"
+
+    def _apply_adaptive_statistics(self) -> None:
+        stats = self._adaptive_stats
+        if stats is None:
+            return
+
+        counts = np.clip(stats.state_frame_counts, 1e-6, None)
+        self.initial_probabilities = stats.initial_counts / np.sum(stats.initial_counts)
+        transition = stats.transition_counts / np.sum(stats.transition_counts, axis=1, keepdims=True)
+        transition = np.clip(transition, 1e-12, None)
+        transition /= transition.sum(axis=1, keepdims=True)
+        self.transition_matrix = transition
+
+        means = stats.mean_accumulator / counts[:, None]
+        self.state_means = means
+
+        covariances = np.empty((self.n_states, self.lpc_order, self.lpc_order), dtype=np.float64)
+        for state in range(self.n_states):
+            second = stats.second_moment_accumulator[state] / counts[state]
+            mean = means[state]
+            cov = second - np.outer(mean, mean)
+            cov += np.eye(self.lpc_order) * self.COVARIANCE_REGULARIZATION_EPSILON
+            cov_eigs = np.linalg.eigvalsh(cov)
+            min_eig = float(np.min(cov_eigs))
+            if min_eig < self.COVARIANCE_MIN_EIGENVALUE:
+                cov += np.eye(self.lpc_order) * (
+                    self.COVARIANCE_MIN_EIGENVALUE - min_eig + self.COVARIANCE_REGULARIZATION_EPSILON
+                )
+            covariances[state] = cov
+
+        self.state_covariances = covariances
+        self._reset_caches()
+        self._compute_and_cache_cholesky_factors()
+        self._transition_cost_matrix()
+
+    def _merge_training_memory(
+        self,
+        frames,
+        lpc_coeffs,
+        residuals,
+        perceptual_vectors,
+        flux_values,
+        *,
+        memory_limit: int,
+        memory_blend: float,
+        rng: np.random.Generator,
+    ) -> None:
+        if self.training_frames is None or self.training_frames.size == 0:
+            self.training_frames = frames
+            self.lpc_coefficients = lpc_coeffs
+            self.residual_signals = residuals
+            self.perceptual_features = perceptual_vectors
+            self.spectral_flux = flux_values
+        else:
+            existing_frames = self.training_frames
+            existing_lpc = self.lpc_coefficients
+            existing_residuals = self.residual_signals
+            existing_perceptual = self.perceptual_features
+            existing_flux = self.spectral_flux
+
+            total_existing = existing_frames.shape[0]
+            total_new = frames.shape[0]
+            total = total_existing + total_new
+
+            if total <= memory_limit:
+                self.training_frames = np.concatenate([existing_frames, frames], axis=0)
+                self.lpc_coefficients = np.concatenate([existing_lpc, lpc_coeffs], axis=0)
+                self.residual_signals = np.concatenate([existing_residuals, residuals], axis=0)
+                if (
+                    existing_perceptual is not None
+                    and existing_perceptual.size
+                    and perceptual_vectors is not None
+                    and perceptual_vectors.size
+                ):
+                    self.perceptual_features = np.concatenate(
+                        [existing_perceptual, perceptual_vectors], axis=0
+                    )
+                if (
+                    existing_flux is not None
+                    and existing_flux.size
+                    and flux_values is not None
+                    and flux_values.size
+                ):
+                    self.spectral_flux = np.concatenate([existing_flux, flux_values], axis=0)
+            else:
+                target_old = int(round(memory_limit * memory_blend))
+                target_new = memory_limit - target_old
+
+                target_old = min(target_old, total_existing)
+                target_new = min(target_new, total_new)
+                if target_old + target_new < memory_limit:
+                    remainder = memory_limit - (target_old + target_new)
+                    if total_new - target_new >= remainder:
+                        target_new += remainder
+                    else:
+                        target_old = min(total_existing, target_old + remainder)
+
+                old_indices = rng.choice(total_existing, size=target_old, replace=False)
+                new_indices = rng.choice(total_new, size=target_new, replace=False)
+
+                merged_frames = np.concatenate([existing_frames[old_indices], frames[new_indices]], axis=0)
+                merged_lpc = np.concatenate([existing_lpc[old_indices], lpc_coeffs[new_indices]], axis=0)
+                merged_residuals = np.concatenate(
+                    [existing_residuals[old_indices], residuals[new_indices]], axis=0
+                )
+                self.training_frames = merged_frames
+                self.lpc_coefficients = merged_lpc
+                self.residual_signals = merged_residuals
+
+                if (
+                    existing_perceptual is not None
+                    and existing_perceptual.size
+                    and perceptual_vectors is not None
+                    and perceptual_vectors.size
+                ):
+                    merged_perceptual = np.concatenate(
+                        [existing_perceptual[old_indices], perceptual_vectors[new_indices]],
+                        axis=0,
+                    )
+                    self.perceptual_features = merged_perceptual
+                if (
+                    existing_flux is not None
+                    and existing_flux.size
+                    and flux_values is not None
+                    and flux_values.size
+                ):
+                    merged_flux = np.concatenate(
+                        [existing_flux[old_indices], flux_values[new_indices]],
+                        axis=0,
+                    )
+                    self.spectral_flux = merged_flux
     
     def _estimate_state_assignments(self):
         if self._caches.state_assignments is not None:
@@ -2048,6 +2340,7 @@ class SpectralStateGuidedSynthesis:
         precision=np.float32,
         pack_covariances=True,
         include_training_artifacts=False,
+        include_adaptive_statistics=True,
     ):
         """Serialize trained model parameters to disk with optional compression."""
         if self.transition_matrix is None:
@@ -2071,7 +2364,9 @@ class SpectralStateGuidedSynthesis:
             "pack_covariances": bool(pack_covariances),
             "precision": target_dtype.name,
             "includes_training_artifacts": bool(include_training_artifacts),
+            "includes_adaptive_statistics": bool(include_adaptive_statistics),
             "sample_rate": int(self.sample_rate) if self.sample_rate is not None else None,
+            "adaptive_memory_limit": int(self.adaptive_memory_limit),
         }
 
         payload = {
@@ -2108,6 +2403,28 @@ class SpectralStateGuidedSynthesis:
                         arr = arr.astype(target_dtype, copy=False)
                     payload[f"frame_metadata__{key}"] = arr
 
+        if include_adaptive_statistics and self._adaptive_stats is not None:
+            stats = self._adaptive_stats
+            payload["adaptive_state_frame_counts"] = stats.state_frame_counts.astype(
+                target_dtype, copy=False
+            )
+            payload["adaptive_transition_counts"] = stats.transition_counts.astype(
+                target_dtype, copy=False
+            )
+            payload["adaptive_mean_accumulator"] = stats.mean_accumulator.astype(
+                target_dtype, copy=False
+            )
+            payload["adaptive_second_moment"] = stats.second_moment_accumulator.astype(
+                target_dtype, copy=False
+            )
+            payload["adaptive_initial_counts"] = stats.initial_counts.astype(
+                target_dtype, copy=False
+            )
+            payload["adaptive_total_frames"] = np.array(stats.total_frames, dtype=target_dtype)
+            payload["adaptive_last_adaptation"] = np.array(
+                stats.last_adaptation or "", dtype=np.str_
+            )
+
         payload["metadata"] = np.array(json.dumps(metadata), dtype=np.str_)
 
         saver = np.savez_compressed if use_compression else np.savez
@@ -2126,6 +2443,7 @@ class SpectralStateGuidedSynthesis:
                 frame_size=metadata["frame_size"],
                 hop_size=metadata["hop_size"],
                 smoothness_weight=metadata.get("smoothness_weight", 0.5),
+                adaptive_memory_limit=metadata.get("adaptive_memory_limit", 6000),
             )
 
             transition = data["transition_matrix"].astype(np.float64, copy=False)
@@ -2173,6 +2491,27 @@ class SpectralStateGuidedSynthesis:
 
             model.sample_rate = metadata.get("sample_rate")
 
+            if metadata.get("includes_adaptive_statistics") and "adaptive_state_frame_counts" in data:
+                model._adaptive_stats = _AdaptiveStatistics(
+                    state_frame_counts=data["adaptive_state_frame_counts"].astype(
+                        np.float64, copy=False
+                    ),
+                    transition_counts=data["adaptive_transition_counts"].astype(
+                        np.float64, copy=False
+                    ),
+                    mean_accumulator=data["adaptive_mean_accumulator"].astype(
+                        np.float64, copy=False
+                    ),
+                    second_moment_accumulator=data["adaptive_second_moment"].astype(
+                        np.float64, copy=False
+                    ),
+                    initial_counts=data["adaptive_initial_counts"].astype(
+                        np.float64, copy=False
+                    ),
+                    total_frames=float(data["adaptive_total_frames"].item()),
+                    last_adaptation=data["adaptive_last_adaptation"].item() or None,
+                )
+
         model._reset_caches()
         model._compute_and_cache_cholesky_factors()
         model._transition_cost_matrix()
@@ -2184,6 +2523,7 @@ class SpectralStateGuidedSynthesis:
         *,
         precision=np.float32,
         include_training_artifacts=True,
+        include_adaptive_statistics=True,
     ):
         """
         Save model checkpoint in safetensors format.
@@ -2260,9 +2600,33 @@ class SpectralStateGuidedSynthesis:
             "smoothness_weight": str(self.smoothness_weight),
             "precision": target_dtype.name,
             "includes_training_artifacts": str(include_training_artifacts),
+            "includes_adaptive_statistics": str(include_adaptive_statistics),
             "sample_rate": str(self.sample_rate) if self.sample_rate is not None else "None",
             "frame_metadata_keys": json.dumps(list(self.frame_metadata.keys()) if self.frame_metadata else []),
+            "adaptive_memory_limit": str(self.adaptive_memory_limit),
         }
+
+        if include_adaptive_statistics and self._adaptive_stats is not None:
+            stats = self._adaptive_stats
+            tensors["adaptive_state_frame_counts"] = stats.state_frame_counts.astype(
+                target_dtype, copy=False
+            )
+            tensors["adaptive_transition_counts"] = stats.transition_counts.astype(
+                target_dtype, copy=False
+            )
+            tensors["adaptive_mean_accumulator"] = stats.mean_accumulator.astype(
+                target_dtype, copy=False
+            )
+            tensors["adaptive_second_moment"] = stats.second_moment_accumulator.astype(
+                target_dtype, copy=False
+            )
+            tensors["adaptive_initial_counts"] = stats.initial_counts.astype(
+                target_dtype, copy=False
+            )
+            tensors["adaptive_total_frames"] = np.array(stats.total_frames, dtype=target_dtype)
+            tensors["adaptive_last_adaptation"] = np.array(
+                stats.last_adaptation or "", dtype=np.str_
+            )
         
         # Save with metadata
         save_file(tensors, filepath, metadata=metadata)
@@ -2328,6 +2692,7 @@ class SpectralStateGuidedSynthesis:
             frame_size=int(metadata.get("frame_size", 1024)),
             hop_size=int(metadata.get("hop_size", 256)),
             smoothness_weight=float(metadata.get("smoothness_weight", 0.5)),
+            adaptive_memory_limit=int(metadata.get("adaptive_memory_limit", 6000)),
         )
         
         # Load core model parameters
@@ -2387,6 +2752,28 @@ class SpectralStateGuidedSynthesis:
             model.sample_rate = None
         else:
             model.sample_rate = int(sample_rate_val)
+
+        includes_adaptive = metadata.get("includes_adaptive_statistics", "False") == "True"
+        if includes_adaptive and "adaptive_state_frame_counts" in tensors:
+            model._adaptive_stats = _AdaptiveStatistics(
+                state_frame_counts=tensors["adaptive_state_frame_counts"].astype(
+                    np.float64, copy=False
+                ),
+                transition_counts=tensors["adaptive_transition_counts"].astype(
+                    np.float64, copy=False
+                ),
+                mean_accumulator=tensors["adaptive_mean_accumulator"].astype(
+                    np.float64, copy=False
+                ),
+                second_moment_accumulator=tensors["adaptive_second_moment"].astype(
+                    np.float64, copy=False
+                ),
+                initial_counts=tensors["adaptive_initial_counts"].astype(
+                    np.float64, copy=False
+                ),
+                total_frames=float(tensors["adaptive_total_frames"].item()),
+                last_adaptation=str(tensors["adaptive_last_adaptation"].item() or "") or None,
+            )
         
         model._reset_caches()
         model._compute_and_cache_cholesky_factors()
@@ -2557,6 +2944,112 @@ class SpectralStateGuidedSynthesis:
         self.identify_graph_constraints()
         
         print("Training complete!")
+
+    def adapt_to_audio(
+        self,
+        audio_signal,
+        sample_rate=16000,
+        *,
+        adaptation_rate: float = 0.25,
+        stability_bias: float = 0.05,
+        memory_blend: float = 0.7,
+        memory_limit: Optional[int] = None,
+        n_adaptation_iterations: int = 1,
+    ) -> Dict[str, float]:
+        """
+        Adapt the model to new audio while preserving persistent memory.
+
+        Args:
+            audio_signal: New audio samples to adapt to.
+            sample_rate: Sampling rate of the input audio.
+            adaptation_rate: Blend factor for new statistics (0.0-1.0).
+            stability_bias: Regularization strength to avoid degenerate updates (0.0-1.0).
+            memory_blend: Fraction of memory reserved for existing training frames.
+            memory_limit: Optional override of adaptive_memory_limit.
+            n_adaptation_iterations: Additional EM iterations on the new data.
+
+        Returns:
+            Dictionary of adaptation metrics.
+        """
+        if self.transition_matrix is None:
+            raise ValueError("Model must be trained before adaptation")
+
+        memory_limit = int(memory_limit or self.adaptive_memory_limit)
+        self._validate_adaptation_inputs(adaptation_rate, stability_bias, memory_blend, memory_limit)
+
+        (
+            frames,
+            lpc_coeffs,
+            residuals,
+            perceptual_vectors,
+            flux_values,
+            frame_metadata,
+        ) = self._extract_features_for_adaptation(audio_signal, sample_rate)
+
+        rng = np.random.default_rng()
+        self._merge_training_memory(
+            frames,
+            lpc_coeffs,
+            residuals,
+            perceptual_vectors,
+            flux_values,
+            memory_limit=memory_limit,
+            memory_blend=memory_blend,
+            rng=rng,
+        )
+
+        self.sample_rate = int(sample_rate)
+        self._compute_frame_metadata(self.sample_rate)
+        if self.spectral_flux is not None and self.spectral_flux.size:
+            metadata = self.frame_metadata
+            metadata["spectral_flux"] = self.spectral_flux
+            self.frame_metadata = metadata
+
+        self._reset_caches()
+        self._compute_and_cache_cholesky_factors()
+
+        observations = lpc_coeffs.astype(np.float64, copy=False)
+        gamma, xi, log_likelihood = self._expectation_step(observations)
+
+        for _ in range(max(0, int(n_adaptation_iterations))):
+            self._maximization_step(observations, gamma, xi)
+            gamma, xi, log_likelihood = self._expectation_step(observations)
+
+        self._update_adaptive_statistics(
+            observations,
+            gamma,
+            xi,
+            adaptation_rate=adaptation_rate,
+            stability_bias=stability_bias,
+        )
+        self._apply_adaptive_statistics()
+
+        occupancy = gamma.mean(axis=0)
+        occupancy /= occupancy.sum() + 1e-12
+        entropy = float(-np.sum(occupancy * np.log(occupancy + 1e-12)))
+
+        avg_energy = float(np.mean(frame_metadata["energy"])) if "energy" in frame_metadata else 0.0
+        avg_rms = float(np.mean(frame_metadata["rms"])) if "rms" in frame_metadata else 0.0
+        metrics = {
+            "log_likelihood": float(log_likelihood),
+            "occupancy_entropy": entropy,
+            "adaptation_rate": float(adaptation_rate),
+            "memory_limit": float(memory_limit),
+            "frames_used": float(observations.shape[0]),
+            "avg_energy": avg_energy,
+            "avg_rms": avg_rms,
+        }
+        self._caches.training_history.append(
+            {
+                "iteration": len(self._caches.training_history) + 1,
+                "log_likelihood": metrics["log_likelihood"],
+                "occupancy_entropy": metrics["occupancy_entropy"],
+                "avg_smoothness_penalty": float("nan"),
+                "adaptation_rate": metrics["adaptation_rate"],
+                "frames_used": metrics["frames_used"],
+            }
+        )
+        return metrics
     
     def generate(self, duration_seconds, sample_rate=16000, fidelity=0.0, excitation_type='Karplus-Strong'):
         """
