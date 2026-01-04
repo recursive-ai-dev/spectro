@@ -101,6 +101,43 @@ The README now reflects the real APIs and scripts in the repository while preser
 
 ---
 
+# LOGIC-MAP — Smoothness-First Decoding Correction
+
+## Purpose
+Guarantee that the smoothness-aware decoder actually minimizes spectral smoothness before trading off transition likelihoods, ensuring the A* path is never rougher than a transition-only Viterbi path.
+
+## Logic Chains (Steps 1–3)
+
+### Chain A — Separate Objectives (Step 1)
+**Why:** A combined cost can select a rougher path if transition penalties overpower smoothness, violating the intended heuristic.
+
+**How:**
+1. **Decompose costs** in `_decode_state_sequence` (`ssgs.py`) into a transition-only term and a spectral smoothness matrix.
+2. **Preserve psychoacoustic bias** in the transition term so perceptual weighting still shapes likelihood.
+
+**Mathematical rigor:** Splitting the objective isolates the smoothness metric that the tests measure, keeping it directly comparable to the Viterbi baseline.
+
+---
+
+### Chain B — Lexicographic DP (Step 2)
+**Why:** Minimizing smoothness first guarantees the global spectral cost cannot exceed any alternative with fewer transitions.
+
+**How:**
+1. **Track smoothness cost** as `dp_smooth` and total cost as `dp_total`.
+2. **Select predecessors** that minimize smoothness, then break ties using the weighted transition+smoothness total cost.
+
+**Mathematical rigor:** This is a lexicographic optimization over `(smoothness, total_cost)`, ensuring the primary objective (smoothness) is globally minimized.
+
+---
+
+### Chain C — Stable End-State Selection (Step 3)
+**Why:** Final selection must honor the same ordering used at each step to avoid accidental roughening.
+
+**How:**
+1. **Pick the end state** with minimal smoothness and use total cost only for tie-breaking.
+2. **Backtrack with stored predecessors** to recover the globally smoothest path.
+
+**Mathematical rigor:** The dynamic program remains optimal because each stage preserves the lexicographic ordering, guaranteeing a global minimum in the primary metric.
 # LOGIC-MAP — Production Hardening for Checkpoints, Training Guards, and Determinism
 
 ## Purpose
@@ -143,4 +180,5 @@ Ensure production safety through explicit guardrails (empty inputs, corrupted ch
 ---
 
 ## Result
+Smoothness-aware decoding now respects the intended heuristic, producing a path whose spectral smoothness is never worse than a transition-only decode while still honoring probabilistic transition structure.
 The model now fails safely on empty data, resists corrupted checkpoint loads, and uses deterministic test signals to preserve repeatable, mathematically meaningful validation.

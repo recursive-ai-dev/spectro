@@ -35,6 +35,26 @@ python test_adaptive_persistence.py
 
 ---
 
+# TESTING — Smoothness-First Decoder Coverage
+
+## Purpose
+Validate that the smoothness-aware decoder produces paths that are at least as spectrally smooth as a transition-only Viterbi baseline when decoding noisy signals.
+
+## Tests Implemented
+### 1) A* vs Viterbi Smoothness Comparison
+**Script:** `test_ssgs.py` (`test_astar_vs_viterbi_decoding`)
+- Trains on a real synthetic signal with multiple frequency regimes plus noise.
+- Decodes a short sequence using the smoothness-aware A* path and a transition-only Viterbi path.
+- Computes spectral smoothness cost on both paths and asserts the A* path is less than or equal to Viterbi.
+
+## How to Run
+```bash
+pytest -q test_ssgs.py::test_astar_vs_viterbi_decoding
+```
+
+## Expected Outcomes
+- A* decoding returns a path with spectral smoothness cost **≤** Viterbi.
+- The decoder remains deterministic and reproducible for the same trained model.
 # Production Hardening Tests
 
 ## Purpose
