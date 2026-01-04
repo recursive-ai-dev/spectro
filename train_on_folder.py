@@ -155,19 +155,8 @@ def train_model(
     
     # Custom training loop with checkpointing
     for iteration in range(n_em_iterations):
-        # Run single EM iteration
-        gamma, xi, log_likelihood = ssgs._expectation_step(ssgs.lpc_coefficients)
-        
-        occupancy = gamma.mean(axis=0)
-        occupancy = occupancy / (occupancy.sum() + 1e-12)
-        entropy = float(-np.sum(occupancy * np.log(occupancy + 1e-12)))
-        
-        smooth_matrix = ssgs._spectral_smoothness_matrix()
-        smooth_penalty = float(
-            np.sum(xi * smooth_matrix[None, :, :]) / (xi.shape[0] + 1e-12)
-        )
-        
-        ssgs._maximization_step(ssgs.lpc_coefficients, gamma, xi)
+        # Run single EM iteration via the public API
+        log_likelihood, entropy, smooth_penalty = ssgs.run_em_iteration()
         
         logger.info(
             f"Iteration {iteration + 1}/{n_em_iterations}: "
