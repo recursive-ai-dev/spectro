@@ -2301,9 +2301,24 @@ class SpectralStateGuidedSynthesis:
         with open(filepath, 'rb') as f:
             # Read header size (first 8 bytes)
             header_size_bytes = f.read(8)
+            if len(header_size_bytes) != 8:
+                raise ValueError("Invalid safetensors file: unable to read header size")
             header_size = int.from_bytes(header_size_bytes, byteorder='little')
+            # Sanity-check header size to avoid malicious or corrupted files
+            MAX_HEADER_SIZE = 1024 * 1024  # 1 MB
+            if header_size <= 0 or header_size > MAX_HEADER_SIZE:
+                raise ValueError(
+                    f"Invalid safetensors file: header size {header_size} out of bounds"
+                )
+            file_size = filepath.stat().st_size
+            if 8 + header_size > file_size:
+                raise ValueError(
+                    "Invalid safetensors file: declared header size exceeds file size"
+                )
             # Read header
             header_bytes = f.read(header_size)
+            if len(header_bytes) != header_size:
+                raise ValueError("Invalid safetensors file: incomplete header data")
             header = json.loads(header_bytes.decode('utf-8'))
             metadata = header.get('__metadata__', {})
         
