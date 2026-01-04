@@ -2174,6 +2174,211 @@ class SpectralStateGuidedSynthesis:
         model._transition_cost_matrix()
         return model
 
+    def save_checkpoint(
+        self,
+        filepath,
+        *,
+        precision=np.float32,
+        include_training_artifacts=True,
+    ):
+        """
+        Save model checkpoint in safetensors format.
+        
+        Safetensors is a secure format for storing tensors with:
+        - Fast loading/saving
+        - Memory-efficient
+        - Zero-copy when possible
+        - No arbitrary code execution (unlike pickle)
+        
+        Args:
+            filepath: Path to save checkpoint (.safetensors extension)
+            precision: Data type for floating point values (default: np.float32)
+            include_training_artifacts: Whether to include training data
+        """
+        try:
+            from safetensors.numpy import save_file
+        except ImportError:
+            raise ImportError(
+                "safetensors is required for checkpoint saving. "
+                "Install with: pip install safetensors"
+            )
+        
+        if self.transition_matrix is None:
+            raise ValueError("Model must be trained before saving checkpoint")
+        
+        target_dtype = np.dtype(precision)
+        if target_dtype.kind != "f":
+            raise ValueError("precision must be a floating-point dtype")
+        
+        filepath = Path(filepath)
+        if filepath.suffix != ".safetensors":
+            filepath = filepath.with_suffix(".safetensors")
+        
+        # Prepare tensors dictionary
+        tensors = {}
+        
+        # Core model parameters
+        tensors["transition_matrix"] = self.transition_matrix.astype(target_dtype, copy=False)
+        tensors["initial_probabilities"] = self.initial_probabilities.astype(target_dtype, copy=False)
+        tensors["state_means"] = self.state_means.astype(target_dtype, copy=False)
+        tensors["state_covariances"] = self.state_covariances.astype(target_dtype, copy=False)
+        
+        # Training artifacts (optional)
+        if include_training_artifacts:
+            if self.training_frames is not None:
+                tensors["training_frames"] = self.training_frames.astype(target_dtype, copy=False)
+            if self.lpc_coefficients is not None:
+                tensors["lpc_coefficients"] = self.lpc_coefficients.astype(target_dtype, copy=False)
+            if self.residual_signals is not None:
+                tensors["residual_signals"] = self.residual_signals.astype(target_dtype, copy=False)
+            if self.perceptual_features is not None and self.perceptual_features.size > 0:
+                tensors["perceptual_features"] = self.perceptual_features.astype(target_dtype, copy=False)
+            if self.spectral_flux is not None and self.spectral_flux.size > 0:
+                tensors["spectral_flux"] = self.spectral_flux.astype(target_dtype, copy=False)
+            
+            # Frame metadata
+            if self.frame_metadata:
+                for key, values in self.frame_metadata.items():
+                    arr = np.asarray(values)
+                    if arr.dtype.kind == "f":
+                        arr = arr.astype(target_dtype, copy=False)
+                    tensors[f"frame_metadata__{key}"] = arr
+        
+        # Prepare metadata as a JSON string stored as bytes
+        # Note: safetensors metadata values must be strings
+        metadata = {
+            "format": "safetensors",
+            "version": "1",
+            "n_states": str(self.n_states),
+            "lpc_order": str(self.lpc_order),
+            "frame_size": str(self.frame_size),
+            "hop_size": str(self.hop_size),
+            "smoothness_weight": str(self.smoothness_weight),
+            "precision": target_dtype.name,
+            "includes_training_artifacts": str(include_training_artifacts),
+            "sample_rate": str(self.sample_rate) if self.sample_rate is not None else "None",
+            "frame_metadata_keys": str(list(self.frame_metadata.keys()) if self.frame_metadata else []),
+        }
+        
+        # Save with metadata
+        save_file(tensors, filepath, metadata=metadata)
+        logger.info(f"Checkpoint saved to {filepath}")
+        
+    @classmethod
+    def load_checkpoint(cls, filepath):
+        """
+        Load model checkpoint from safetensors format.
+        
+        Args:
+            filepath: Path to checkpoint file (.safetensors)
+            
+        Returns:
+            SpectralStateGuidedSynthesis: Loaded model instance
+        """
+        try:
+            from safetensors.numpy import load_file
+        except ImportError:
+            raise ImportError(
+                "safetensors is required for checkpoint loading. "
+                "Install with: pip install safetensors"
+            )
+        
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {filepath}")
+        
+        # Load tensors and metadata
+        tensors = load_file(filepath)
+        
+        # Parse metadata from safetensors file
+        # Safetensors stores metadata in the file header
+        import json
+        with open(filepath, 'rb') as f:
+            # Read header size (first 8 bytes)
+            header_size_bytes = f.read(8)
+            header_size = int.from_bytes(header_size_bytes, byteorder='little')
+            # Read header
+            header_bytes = f.read(header_size)
+            header = json.loads(header_bytes.decode('utf-8'))
+            metadata = header.get('__metadata__', {})
+        
+        # Create model instance
+        model = cls(
+            n_states=int(metadata.get("n_states", 34)),
+            lpc_order=int(metadata.get("lpc_order", 12)),
+            frame_size=int(metadata.get("frame_size", 1024)),
+            hop_size=int(metadata.get("hop_size", 256)),
+            smoothness_weight=float(metadata.get("smoothness_weight", 0.5)),
+        )
+        
+        # Load core model parameters
+        transition = tensors["transition_matrix"].astype(np.float64, copy=False)
+        transition = np.clip(transition, 1e-12, None)
+        transition /= transition.sum(axis=1, keepdims=True)
+        model.transition_matrix = transition
+        
+        init_probs = tensors["initial_probabilities"].astype(np.float64, copy=False)
+        init_probs = np.clip(init_probs, 1e-12, None)
+        model.initial_probabilities = init_probs / init_probs.sum()
+        
+        model.state_means = tensors["state_means"].astype(np.float64, copy=False)
+        model.state_covariances = tensors["state_covariances"].astype(np.float64, copy=False)
+        
+        # Ensure covariance matrices are positive definite after loading
+        # (precision loss during save/load may require re-regularization)
+        for state in range(model.n_states):
+            cov = model.state_covariances[state]
+            # Add small regularization to ensure positive definiteness
+            min_eig = np.min(np.linalg.eigvalsh(cov))
+            if min_eig < 1e-4:
+                model.state_covariances[state] = cov + np.eye(model.lpc_order) * (1e-4 - min_eig + 1e-5)
+        
+        # Load training artifacts if present
+        if "training_frames" in tensors:
+            model.training_frames = tensors["training_frames"].astype(np.float32, copy=False)
+        if "lpc_coefficients" in tensors:
+            model.lpc_coefficients = tensors["lpc_coefficients"].astype(np.float32, copy=False)
+        if "residual_signals" in tensors:
+            model.residual_signals = tensors["residual_signals"].astype(np.float32, copy=False)
+        if "perceptual_features" in tensors:
+            model.perceptual_features = tensors["perceptual_features"].astype(np.float32, copy=False)
+        if "spectral_flux" in tensors:
+            model.spectral_flux = tensors["spectral_flux"].astype(np.float32, copy=False)
+        
+        # Load frame metadata
+        meta_keys_str = metadata.get("frame_metadata_keys", "[]")
+        # Parse the string representation of the list
+        import ast
+        try:
+            if isinstance(meta_keys_str, str):
+                meta_keys = ast.literal_eval(meta_keys_str)
+            else:
+                meta_keys = meta_keys_str
+        except (ValueError, SyntaxError):
+            meta_keys = []
+        
+        if meta_keys:
+            frame_meta: Dict[str, np.ndarray] = {}
+            for key in meta_keys:
+                if f"frame_metadata__{key}" in tensors:
+                    frame_meta[key] = tensors[f"frame_metadata__{key}"].copy()
+            model.frame_metadata = frame_meta
+        else:
+            model.frame_metadata = {}
+        
+        sample_rate_val = metadata.get("sample_rate", "None")
+        if sample_rate_val == "None" or sample_rate_val is None:
+            model.sample_rate = None
+        else:
+            model.sample_rate = int(sample_rate_val)
+        
+        model._reset_caches()
+        model._compute_and_cache_cholesky_factors()
+        model._transition_cost_matrix()
+        
+        logger.info(f"Checkpoint loaded from {filepath}")
+        return model
+
     def _extract_features_from_files(self, audio_files, sample_rate=16000):
         """
         Extract features from multiple audio files and concatenate them.
