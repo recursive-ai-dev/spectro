@@ -126,7 +126,7 @@ This is how SSGS generates *novel signals* even from short or simple training da
 
 ---
 
-## Model Export & Compression
+## Model Export, Compression, and Checkpointing
 
 After training you can persist the learned parameters in a compact archive:
 
@@ -140,6 +140,16 @@ ssgs.export_model("models/ssgs_baseline", use_compression=True, pack_covariances
 - Set `include_training_artifacts=True` if you also need cached LPC and residual
    buffers for later analysis.
 - Reload the model with `SpectralStateGuidedSynthesis.load_model(path)`.
+
+For long-running training, SSGS also supports `.safetensors` checkpoints:
+
+```python
+ssgs.save_checkpoint("models/checkpoint_epoch_5.safetensors")
+ssgs = SpectralStateGuidedSynthesis.load_checkpoint("models/checkpoint_epoch_5.safetensors")
+```
+
+Checkpoints can optionally persist adaptive statistics so continuous learning can resume
+without reprocessing previous audio.
 
 ---
 
@@ -170,46 +180,110 @@ More states = more spectral patterns the model can learn and generate = richer, 
 
 SSGS produces time-domain and spectral visualizations like this:
 
-*(Place your `ssgs_demo.png` here)*
+![SSGS demo output](ssgs_demo.png)
+
+For a deeper comparison diagnostic, see `ssgs_analysis.png`.
 
 The generated signal is not a copy —  
 it is a **new trajectory** through learned spectral states.
 
 ---
 
-## Testing
+## Quick Start
 
-Run the included test script:
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run the demo training + generation script:
 
 ```bash
 python test_ssgs.py
 ```
 
-It will:
+Run the enhanced capabilities demo (defaults to 34 states):
 
-train the model on a synthetic test signal
+```bash
+python demo_enhanced_capabilities.py
+```
 
-generate a new signal
+Train on folders of audio with checkpointing:
 
-plot time-domain and spectral comparison
+```bash
+python train_on_folder.py --folders training_001 training_002
+```
 
-save or display diagnostics
+## Adaptive Learning
+
+SSGS can adapt to new audio using persistent statistics:
+
+```python
+ssgs.adapt_to_audio(new_audio, sample_rate=16000, adaptation_rate=0.5, memory_blend=0.3)
+```
+
+Adaptation can be exported through `.npz` or `.safetensors` artifacts and reloaded later.
+
+## Feature Indexing & Retrieval
+
+Use built-in nearest-neighbor search over frame features for exploration and analysis:
+
+```python
+index = ssgs.build_feature_index(feature_space="lpc", normalize=True)
+result = ssgs.query_similar_frames(frame_idx=42, k=8, feature_space="lpc")
+vector_result = ssgs.search_by_feature_vector(
+    vector=index.tree.data[0],
+    k=5,
+    feature_space="lpc",
+)
+```
+
+The returned `FrameQueryResult` includes indices, optional distances, and frame metadata.
+
+## Testing
+
+Run individual checks as standalone scripts:
+
+```bash
+python test_ssgs.py
+python test_checkpoints.py
+python test_adaptive_persistence.py
+python test_data_indexing.py
+python test_gain_control.py
+python test_generative_capabilities.py
+python test_utils.py
+```
 
 
 ### Requirements
 
-numpy>=1.21.0 \
-scipy>=1.7.0 \
-matplotlib>=3.4.0 \
-soundfile>=0.10.0 \
+```
+numpy>=1.21.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+soundfile>=0.10.0
+PyWavelets>=1.1.0
+safetensors>=0.4.0
+```
 
 ### Project Structure
 
-ssgs.py            # Full model implementation \
-test_ssgs.py       # Training + generation demo \
-requirements.txt   # Dependencies \
-ssgs_demo.png      # Example output \
-README.md          # This document \
+ssgs.py                        # Full model implementation \
+train_on_folder.py             # Folder-based training with checkpointing \
+demo_enhanced_capabilities.py  # State-count showcase \
+example_checkpoints.py         # Checkpoint usage example \
+example_fidelity.py            # Fidelity-focused generation example \
+test_ssgs.py                   # Training + generation demo \
+test_checkpoints.py            # Checkpoint save/load tests \
+test_adaptive_persistence.py   # Adaptive learning tests \
+test_data_indexing.py          # Feature index tests \
+test_gain_control.py           # Gain control tests \
+test_generative_capabilities.py # State-count tests \
+requirements.txt               # Dependencies \
+ssgs_demo.png                  # Example output \
+ssgs_analysis.png              # Diagnostic output \
+README.md                      # This document \
 
 
 ### Authors

@@ -37,3 +37,34 @@ We selected the blended adaptive-statistics path because it satisfies all three 
 - **CEO:** Demonstrates persistent learning and measurable adaptation.
 - **Junior Dev:** Adds clear, compartmentalized logic that is easy to reason about.
 - **End Customer:** Maintains creative continuity while still evolving from new audio.
+
+---
+
+# README Alignment Update — Perspective Mapping
+
+### CEO Perspective (Credibility + Adoption)
+**Goal:** Ensure first-run success and reduced onboarding friction.
+
+**Choice:** Documented the current scripts, checkpoint formats, and dependencies so new users can reproduce results without guesswork.
+- **Mapping:** LOGIC-MAP README Chain A and B.
+
+---
+
+### Junior Developer Perspective (Accuracy + Maintenance)
+**Goal:** Keep documentation aligned with real APIs so changes do not drift.
+
+**Choice:** Tied Quick Start and API examples directly to existing methods (`save_checkpoint`, `adapt_to_audio`, `build_feature_index`) and current test scripts.
+- **Mapping:** LOGIC-MAP README Chain A and C.
+
+---
+
+### End-Customer Perspective (Usability + Trust)
+**Goal:** Offer a clear, runnable path to generate audio and persist models.
+
+**Choice:** Added explicit run commands and checkpoint examples so users can immediately validate output on their own data.
+- **Mapping:** LOGIC-MAP README Chain B.
+
+---
+
+## Decision Summary
+We updated the README to reduce ambiguity, reflect real entry points, and preserve the operational path from training to persistence.

@@ -32,3 +32,27 @@ python test_adaptive_persistence.py
 - **Valid rates (0, 1)** adapt without errors and update adaptive statistics.
 - **Invalid rates (-1, 2..12)** must raise `ValueError`.
 - Adaptive statistics are preserved across export/load.
+
+---
+
+# README Alignment Validation
+
+## Purpose
+Ensure the documentation references executable scripts and valid APIs so onboarding steps remain reliable.
+
+## Validation Checklist
+1. **Quick Start scripts exist:** `test_ssgs.py`, `demo_enhanced_capabilities.py`, `train_on_folder.py`.
+2. **Checkpoint APIs are present:** `save_checkpoint` and `load_checkpoint` in `ssgs.py`.
+3. **Adaptive learning API is present:** `adapt_to_audio` in `ssgs.py`.
+4. **Feature indexing APIs are present:** `build_feature_index`, `query_similar_frames`, and `search_by_feature_vector` in `ssgs.py`.
+5. **Test scripts listed in README exist:** all `test_*.py` files referenced by name.
+
+## How to Run (Spot Checks)
+```bash
+python test_ssgs.py
+python test_checkpoints.py
+```
+
+## Expected Outcomes
+- Scripts complete without import errors when dependencies are installed.
+- Checkpoint and adaptive APIs execute with real signals, confirming documented behavior.
