@@ -68,3 +68,34 @@ We selected the blended adaptive-statistics path because it satisfies all three 
 
 ## Decision Summary
 We updated the README to reduce ambiguity, reflect real entry points, and preserve the operational path from training to persistence.
+
+---
+
+# Smoothness-First Decoder — Perspective Mapping
+
+### CEO Perspective (Reliability + Claims)
+**Goal:** Ensure the decoder’s smoothness heuristic matches the product claim of stable, globally coherent paths.
+
+**Choice:** A lexicographic smoothness-first decode ensures spectral smoothness is always minimized before likelihood trade-offs.
+- **Mapping:** LOGIC-MAP Smoothness-First Chains A–C.
+
+---
+
+### Junior Developer Perspective (Debuggability + Intent)
+**Goal:** Make the decode objective explicit so it is easy to reason about test expectations.
+
+**Choice:** Split the transition, psychoacoustic, and smoothness objectives into separate DP tracks, then tie-break.
+- **Mapping:** LOGIC-MAP Smoothness-First Chain B.
+
+---
+
+### End-Customer Perspective (Audio Quality + Consistency)
+**Goal:** Produce sequences that avoid erratic state jumps, matching the smoother audio output users expect.
+
+**Choice:** Prioritize smoothness at every decoding step so the resulting path avoids unnecessary spectral jumps.
+- **Mapping:** LOGIC-MAP Smoothness-First Chain C.
+
+---
+
+## Decision Summary
+We chose lexicographic decoding to honor smoothness claims, keep the logic readable, and deliver the most coherent output for listeners.

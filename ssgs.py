@@ -1881,20 +1881,61 @@ class SpectralStateGuidedSynthesis:
         return self._decode_state_sequence(target_duration_frames)
 
     def _decode_state_sequence(self, target_frames):
-        """Deterministic dynamic-programming decode with smoothness penalty."""
-        transition_cost = self._transition_cost_matrix()
+        """Deterministic dynamic-programming decode with smoothness-first objective."""
+        if self.transition_matrix is None or self.initial_probabilities is None:
+            raise ValueError("HMM parameters are not initialized")
+
         initial_cost = -np.log(self.initial_probabilities + 1e-12)
+        transition_cost = -np.log(self.transition_matrix + 1e-12)
+        psycho_weight = self._compute_psychoacoustic_weight()
+        transition_cost = transition_cost + 0.25 * psycho_weight[np.newaxis, :]
+        smoothness = self._spectral_smoothness_matrix()
 
-        dp = np.empty((target_frames, self.n_states), dtype=np.float64)
-        backpointer = np.zeros((target_frames, self.n_states), dtype=np.int32)
+        if self.smoothness_weight <= 0.0:
+            dp = np.empty((target_frames, self.n_states), dtype=np.float64)
+            backpointer = np.zeros((target_frames, self.n_states), dtype=np.int32)
+            dp[0] = initial_cost
 
-        dp[0] = initial_cost
-        for t in range(1, target_frames):
-            costs = dp[t - 1][:, None] + transition_cost
-            backpointer[t] = np.argmin(costs, axis=0)
-            dp[t] = np.min(costs, axis=0)
+            for t in range(1, target_frames):
+                costs = dp[t - 1][:, None] + transition_cost
+                backpointer[t] = np.argmin(costs, axis=0)
+                dp[t] = np.min(costs, axis=0)
 
-        end_state = int(np.argmin(dp[-1]))
+            end_state = int(np.argmin(dp[-1]))
+        else:
+            dp_smooth = np.empty((target_frames, self.n_states), dtype=np.float64)
+            dp_total = np.empty((target_frames, self.n_states), dtype=np.float64)
+            backpointer = np.zeros((target_frames, self.n_states), dtype=np.int32)
+            dp_smooth[0] = 0.0
+            dp_total[0] = initial_cost
+
+            tolerance = 1e-9
+
+            for t in range(1, target_frames):
+                for j in range(self.n_states):
+                    smooth_candidates = dp_smooth[t - 1] + smoothness[:, j]
+                    min_smooth = float(np.min(smooth_candidates))
+                    candidate_mask = smooth_candidates <= (min_smooth + tolerance)
+                    total_candidates = (
+                        dp_total[t - 1]
+                        + transition_cost[:, j]
+                        + self.smoothness_weight * smoothness[:, j]
+                    )
+                    candidate_indices = np.where(candidate_mask)[0]
+                    best_local = candidate_indices[
+                        int(np.argmin(total_candidates[candidate_mask]))
+                    ]
+                    dp_smooth[t, j] = min_smooth
+                    dp_total[t, j] = total_candidates[best_local]
+                    backpointer[t, j] = best_local
+
+            final_smooth = dp_smooth[-1]
+            min_smooth = float(np.min(final_smooth))
+            final_mask = final_smooth <= (min_smooth + tolerance)
+            end_state = int(
+                np.where(final_mask)[0][np.argmin(dp_total[-1][final_mask])]
+            )
+
         path = [0] * target_frames
         path[-1] = end_state
 
