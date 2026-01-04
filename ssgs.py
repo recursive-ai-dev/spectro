@@ -2250,7 +2250,6 @@ class SpectralStateGuidedSynthesis:
         
         # Prepare metadata as a JSON string stored as bytes
         # Note: safetensors metadata values must be strings
-        import json
         metadata = {
             "format": "safetensors",
             "version": "1",
