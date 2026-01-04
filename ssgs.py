@@ -2368,7 +2368,6 @@ class SpectralStateGuidedSynthesis:
         # Load frame metadata
         meta_keys_str = metadata.get("frame_metadata_keys", "[]")
         # Parse the JSON string
-        import json
         try:
             meta_keys = json.loads(meta_keys_str)
         except (ValueError, json.JSONDecodeError):
