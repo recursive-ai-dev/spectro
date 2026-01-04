@@ -2520,7 +2520,7 @@ class SpectralStateGuidedSynthesis:
         # Check if we have multiple files/signals
         if isinstance(audio_signal, (list, tuple)):
             print(f"Batch mode: Training on {len(audio_signal)} audio files/signals")
-            self._extract_features_from_files(audio_signal, sample_rate)
+            self.extract_features_from_files(audio_signal, sample_rate)
         else:
             # Single signal
             self.extract_features(audio_signal, sample_rate)
