@@ -138,8 +138,47 @@ Guarantee that the smoothness-aware decoder actually minimizes spectral smoothne
 2. **Backtrack with stored predecessors** to recover the globally smoothest path.
 
 **Mathematical rigor:** The dynamic program remains optimal because each stage preserves the lexicographic ordering, guaranteeing a global minimum in the primary metric.
+# LOGIC-MAP — Production Hardening for Checkpoints, Training Guards, and Determinism
+
+## Purpose
+Ensure production safety through explicit guardrails (empty inputs, corrupted checkpoints) and deterministic signal generation for tests and demos.
+
+## Logic Chains (Steps 1–3)
+
+### Chain A — Feature Availability Guard (Step 1)
+**Why:** HMM initialization requires non-empty frame statistics; empty inputs must fail fast with actionable errors.
+
+**How:**
+1. Validate `lpc_coefficients` presence and frame count before clustering in `initialize_hmm_parameters`.
+2. Abort early with a descriptive `ValueError` if `num_frames == 0`.
+
+**Mathematical rigor:** The K-means initialization and subsequent covariance estimation assume non-zero sample counts. Enforcing `num_frames > 0` prevents undefined mean and variance estimates.
+
+---
+
+### Chain B — Checkpoint Tensor Validation (Step 2)
+**Why:** Loading malformed or incomplete checkpoints must produce deterministic failures instead of hidden state corruption.
+
+**How:**
+1. Require core tensors (`transition_matrix`, `initial_probabilities`, `state_means`, `state_covariances`).
+2. Validate tensor dimensionality and shape compatibility with `n_states` and `lpc_order`.
+3. Reject shape mismatches before any normalization or reconstruction.
+
+**Mathematical rigor:** The HMM is defined by these parameters; shape mismatches imply invalid probability simplex or non-positive-definite covariance structures, which break log-likelihood computation.
+
+---
+
+### Chain C — Deterministic Signal Generation (Step 3)
+**Why:** Production tests need reproducibility to isolate regressions and verify mathematical behavior across edge cases.
+
+**How:**
+1. Introduce optional seeded RNGs in `test_utils` signal generators.
+2. Update test entry points to pass stable seeds and avoid global RNG state.
+
+**Mathematical rigor:** Fixed stochastic inputs ensure that statistical assertions (RMS, spectral metrics, covariance stability) are compared against constant distributions rather than drifting random samples.
 
 ---
 
 ## Result
 Smoothness-aware decoding now respects the intended heuristic, producing a path whose spectral smoothness is never worse than a transition-only decode while still honoring probabilistic transition structure.
+The model now fails safely on empty data, resists corrupted checkpoint loads, and uses deterministic test signals to preserve repeatable, mathematically meaningful validation.

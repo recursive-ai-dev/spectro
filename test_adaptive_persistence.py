@@ -26,10 +26,12 @@ def assert_not_allclose(a, b, tol=1e-4):
 
 
 def run_adaptation_persistence_test():
-    np.random.seed(0)
-
     sample_rate = 12000
-    training_signal = create_simple_test_signal(sample_rate=sample_rate, duration=1.5)
+    training_signal = create_simple_test_signal(
+        sample_rate=sample_rate,
+        duration=1.5,
+        seed=1200,
+    )
     adaptation_signal = create_test_signal(
         sample_rate=sample_rate,
         duration=1.0,
@@ -37,6 +39,7 @@ def run_adaptation_persistence_test():
         harmonic_range=(2, 5),
         noise_level=0.003,
         normalize=True,
+        seed=1201,
     )
 
     ssgs = SpectralStateGuidedSynthesis(

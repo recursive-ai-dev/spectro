@@ -34,7 +34,7 @@ def test_default_uses_enhanced_capabilities():
 def test_enhanced_generative_capabilities_112_percent():
     """Test enhanced generative capabilities with 112% increase (34 states)"""
     sample_rate = 16000
-    signal = create_simple_test_signal(sample_rate, duration=1.0)
+    signal = create_simple_test_signal(sample_rate, duration=1.0, seed=112)
     
     # Initialize with enhanced capabilities (112% increase: 16 + 16*1.12 ≈ 34)
     ssgs = SpectralStateGuidedSynthesis(
@@ -78,7 +78,7 @@ def test_enhanced_generative_capabilities_112_percent():
 def test_maximum_generative_capabilities_163_percent():
     """Test maximum generative capabilities with 163% increase (42 states)"""
     sample_rate = 16000
-    signal = create_simple_test_signal(sample_rate, duration=1.0)
+    signal = create_simple_test_signal(sample_rate, duration=1.0, seed=163)
     
     # Initialize with maximum capabilities (163% increase: 16 + 16*1.63 ≈ 42)
     ssgs = SpectralStateGuidedSynthesis(
@@ -122,7 +122,7 @@ def test_maximum_generative_capabilities_163_percent():
 def test_generative_capability_comparison():
     """Compare different generative capability levels"""
     sample_rate = 16000
-    signal = create_simple_test_signal(sample_rate, duration=1.0)
+    signal = create_simple_test_signal(sample_rate, duration=1.0, seed=421)
     
     # Test all three capability levels
     capability_levels = [
@@ -171,7 +171,7 @@ def test_model_export_import_with_enhanced_capabilities():
     import os
     
     sample_rate = 16000
-    signal = create_simple_test_signal(sample_rate, duration=0.5)
+    signal = create_simple_test_signal(sample_rate, duration=0.5, seed=512)
     
     # Create and train model with enhanced capabilities
     ssgs = SpectralStateGuidedSynthesis(n_states=34)

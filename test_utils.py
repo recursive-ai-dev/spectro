@@ -23,6 +23,12 @@ This module provides reusable test signal generation functions.
 import numpy as np
 
 
+def _resolve_rng(rng=None, seed=None):
+    if rng is not None:
+        return rng
+    return np.random.default_rng(seed)
+
+
 def create_test_signal(
     sample_rate=16000,
     duration=2.0,
@@ -32,7 +38,9 @@ def create_test_signal(
     attack_time=0.1,
     decay_time=0.3,
     noise_level=0.005,
-    normalize=False
+    normalize=False,
+    rng=None,
+    seed=None,
 ):
     """
     Create a complex test signal with multiple frequency components.
@@ -49,10 +57,13 @@ def create_test_signal(
         decay_time: Decay time in seconds
         noise_level: Noise amplitude
         normalize: Whether to normalize output to 0.8 max amplitude
+        rng: Optional NumPy random generator for deterministic noise
+        seed: Optional seed used when rng is not provided
     
     Returns:
         signal: Generated test signal as numpy array
     """
+    rng = _resolve_rng(rng, seed)
     t = np.linspace(0, duration, int(sample_rate * duration))
     
     # Base frequency that changes over time (pitch contour/vibrato)
@@ -90,7 +101,7 @@ def create_test_signal(
     signal *= envelope
     
     # Add noise for realism
-    signal += noise_level * np.random.randn(len(signal))
+    signal += noise_level * rng.standard_normal(len(signal))
     
     # Normalize if requested
     if normalize:
@@ -99,7 +110,7 @@ def create_test_signal(
     return signal
 
 
-def create_rich_test_signal(sample_rate=16000, duration=2.0):
+def create_rich_test_signal(sample_rate=16000, duration=2.0, rng=None, seed=None):
     """
     Create a rich harmonic signal for demonstration.
     
@@ -122,11 +133,13 @@ def create_rich_test_signal(sample_rate=16000, duration=2.0):
         attack_time=0.15,
         decay_time=0.3,
         noise_level=0.005,
-        normalize=True
+        normalize=True,
+        rng=rng,
+        seed=seed,
     )
 
 
-def create_simple_test_signal(sample_rate=16000, duration=1.0):
+def create_simple_test_signal(sample_rate=16000, duration=1.0, rng=None, seed=None):
     """
     Create a simple test signal for quick testing.
     
@@ -140,6 +153,7 @@ def create_simple_test_signal(sample_rate=16000, duration=1.0):
     Returns:
         signal: Generated simple test signal as numpy array
     """
+    rng = _resolve_rng(rng, seed)
     t = np.linspace(0, duration, int(sample_rate * duration))
     
     # Create a simpler harmonic signal
@@ -160,7 +174,7 @@ def create_simple_test_signal(sample_rate=16000, duration=1.0):
     signal *= envelope
     
     # Add noise for better LPC stability
-    signal += 0.01 * np.random.randn(len(signal))
+    signal += 0.01 * rng.standard_normal(len(signal))
     
     # Normalize
     signal = signal / (np.max(np.abs(signal)) + 1e-10) * 0.8
@@ -168,7 +182,7 @@ def create_simple_test_signal(sample_rate=16000, duration=1.0):
     return signal
 
 
-def create_fidelity_demo_signal(sample_rate=16000, duration=3.0):
+def create_fidelity_demo_signal(sample_rate=16000, duration=3.0, rng=None, seed=None):
     """
     Create a musical test signal for fidelity demonstrations.
     
@@ -182,6 +196,7 @@ def create_fidelity_demo_signal(sample_rate=16000, duration=3.0):
     Returns:
         signal: Generated test signal as numpy array
     """
+    rng = _resolve_rng(rng, seed)
     t = np.linspace(0, duration, int(sample_rate * duration))
     
     # Musical phrase with variation
@@ -212,7 +227,7 @@ def create_fidelity_demo_signal(sample_rate=16000, duration=3.0):
     signal *= envelope
     
     # Add slight noise
-    signal += 0.005 * np.random.randn(len(signal))
+    signal += 0.005 * rng.standard_normal(len(signal))
     
     # Normalize with safety guard
     signal = signal / (np.max(np.abs(signal)) + 1e-10) * 0.8

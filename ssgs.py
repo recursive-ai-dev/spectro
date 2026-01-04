@@ -1192,6 +1192,10 @@ class SpectralStateGuidedSynthesis:
         """
         if self.lpc_coefficients is None:
             raise ValueError("Must extract features first using extract_features()")
+        if self.lpc_coefficients.shape[0] == 0:
+            raise ValueError(
+                "No frames extracted; check input audio content and sample_rate."
+            )
 
         self._apply_residual_augmentation()
         
@@ -1994,7 +1998,7 @@ class SpectralStateGuidedSynthesis:
         self._caches.spectral_prototypes = prototypes
         return prototypes
     
-    def _karplus_strong_excitation(self, state, duration_samples):
+    def _karplus_strong_excitation(self, state, duration_samples, rng=None):
         """
         Phase 2, Step 6: Excitation Generation using Delay-Line Feedback
         
@@ -2009,10 +2013,11 @@ class SpectralStateGuidedSynthesis:
         spectral_centroid = np.mean(np.abs(mean_coeffs))
 
         base_delay = int(20 + 80 * (1 - np.tanh(spectral_centroid)))
-        delay_line = max(2, base_delay + np.random.randint(-5, 6))
+        rng = rng or np.random.default_rng()
+        delay_line = max(2, base_delay + rng.integers(-5, 6))
 
         excitation = np.zeros(duration_samples, dtype=np.float32)
-        noise_burst = np.random.randn(delay_line).astype(np.float32) * 0.5
+        noise_burst = rng.standard_normal(delay_line).astype(np.float32) * 0.5
 
         damping = 0.98 - 0.1 * spectral_centroid
         damping = float(np.clip(damping, 0.95, 0.99))
@@ -2030,7 +2035,7 @@ class SpectralStateGuidedSynthesis:
         excitation *= envelope
         return excitation
     
-    def _wavelet_excitation(self, state, duration_samples):
+    def _wavelet_excitation(self, state, duration_samples, rng=None):
         """
         Wavelet-based excitation generation as an alternative to Karplus-Strong.
         
@@ -2075,7 +2080,7 @@ class SpectralStateGuidedSynthesis:
         
         # Generate wavelet coefficients from spectral state
         # Use LPC coefficients to modulate wavelet structure
-        rng = np.random.default_rng()
+        rng = rng or np.random.default_rng()
         
         # Create wavelet packet with state-dependent characteristics
         # Detail coefficients (high frequency) influenced by LPC magnitude
@@ -2301,7 +2306,15 @@ class SpectralStateGuidedSynthesis:
         preview = self._apply_gain_floor(preview, minimum_peak=0.75, target_peak=0.9)
         return preview.astype(np.float32), sample_rate
     
-    def synthesize_audio(self, target_duration_seconds, sample_rate=16000, fidelity=0.0, excitation_type='Karplus-Strong'):
+    def synthesize_audio(
+        self,
+        target_duration_seconds,
+        sample_rate=16000,
+        fidelity=0.0,
+        excitation_type='Karplus-Strong',
+        rng=None,
+        seed=None,
+    ):
         """
         Phase 2: Complete Audio Synthesis Pipeline
 
@@ -2314,6 +2327,10 @@ class SpectralStateGuidedSynthesis:
                      Values in between blend both approaches
             excitation_type: Type of excitation for synthesis ('Karplus-Strong' or 'Wavelet')
                            Only used when fidelity < 1.0
+
+        Args:
+            rng: Optional NumPy random generator for deterministic excitation.
+            seed: Optional seed used if rng is not provided.
 
         Returns:
             audio_output: Generated audio signal
@@ -2338,7 +2355,7 @@ class SpectralStateGuidedSynthesis:
         state_sequence = self._a_star_search(target_frames)
 
         audio_output = np.zeros(target_frames * self.hop_size, dtype=np.float32)
-        rng = np.random.default_rng()
+        rng = rng or np.random.default_rng(seed)
 
         print("Step 6-8: Generating excitation, synthesizing audio...")
         for idx, state in enumerate(state_sequence):
@@ -2348,16 +2365,32 @@ class SpectralStateGuidedSynthesis:
             elif fidelity <= 0.0:
                 # Pure synthetic mode: use selected excitation type
                 if excitation_type == 'Karplus-Strong':
-                    excitation = self._karplus_strong_excitation(state, self.hop_size)
+                    excitation = self._karplus_strong_excitation(
+                        state,
+                        self.hop_size,
+                        rng=rng,
+                    )
                 else:  # Wavelet
-                    excitation = self._wavelet_excitation(state, self.hop_size)
+                    excitation = self._wavelet_excitation(
+                        state,
+                        self.hop_size,
+                        rng=rng,
+                    )
             else:
                 # Blend mode: mix both approaches
                 residual_excitation = self._get_training_residual_for_state(state, rng)
                 if excitation_type == 'Karplus-Strong':
-                    synthetic_excitation = self._karplus_strong_excitation(state, self.hop_size)
+                    synthetic_excitation = self._karplus_strong_excitation(
+                        state,
+                        self.hop_size,
+                        rng=rng,
+                    )
                 else:  # Wavelet
-                    synthetic_excitation = self._wavelet_excitation(state, self.hop_size)
+                    synthetic_excitation = self._wavelet_excitation(
+                        state,
+                        self.hop_size,
+                        rng=rng,
+                    )
                 # Linear blend based on fidelity parameter
                 excitation = (fidelity * residual_excitation +
                             (1.0 - fidelity) * synthetic_excitation)
@@ -2672,6 +2705,54 @@ class SpectralStateGuidedSynthesis:
         # Save with metadata
         save_file(tensors, filepath, metadata=metadata)
         logger.info(f"Checkpoint saved to {filepath}")
+
+    @staticmethod
+    def _validate_checkpoint_tensors(tensors, metadata):
+        required_keys = [
+            "transition_matrix",
+            "initial_probabilities",
+            "state_means",
+            "state_covariances",
+        ]
+        missing = [key for key in required_keys if key not in tensors]
+        if missing:
+            raise ValueError(
+                "Checkpoint missing required tensors: " + ", ".join(missing)
+            )
+
+        transition = tensors["transition_matrix"]
+        if transition.ndim != 2 or transition.shape[0] != transition.shape[1]:
+            raise ValueError("transition_matrix must be a square 2D array")
+
+        inferred_states = transition.shape[0]
+        n_states = int(metadata.get("n_states", inferred_states))
+        if inferred_states != n_states:
+            raise ValueError(
+                "transition_matrix shape does not match n_states metadata"
+            )
+
+        initial = tensors["initial_probabilities"]
+        if initial.ndim != 1 or initial.shape[0] != n_states:
+            raise ValueError(
+                "initial_probabilities must be a 1D array with length n_states"
+            )
+
+        means = tensors["state_means"]
+        if means.ndim != 2 or means.shape[0] != n_states:
+            raise ValueError("state_means must be a 2D array with n_states rows")
+
+        lpc_order = int(metadata.get("lpc_order", means.shape[1]))
+        if means.shape[1] != lpc_order:
+            raise ValueError("state_means shape does not match lpc_order metadata")
+
+        covariances = tensors["state_covariances"]
+        if covariances.ndim != 3:
+            raise ValueError("state_covariances must be a 3D array")
+        if covariances.shape != (n_states, lpc_order, lpc_order):
+            raise ValueError(
+                "state_covariances must have shape "
+                f"({n_states}, {lpc_order}, {lpc_order})"
+            )
         
     @classmethod
     def load_checkpoint(cls, filepath):
@@ -2725,6 +2806,8 @@ class SpectralStateGuidedSynthesis:
                 raise ValueError("Invalid safetensors file: incomplete header data")
             header = json.loads(header_bytes.decode('utf-8'))
             metadata = header.get('__metadata__', {})
+
+        cls._validate_checkpoint_tensors(tensors, metadata)
         
         # Create model instance
         model = cls(
@@ -3092,7 +3175,15 @@ class SpectralStateGuidedSynthesis:
         )
         return metrics
     
-    def generate(self, duration_seconds, sample_rate=16000, fidelity=0.0, excitation_type='Karplus-Strong'):
+    def generate(
+        self,
+        duration_seconds,
+        sample_rate=16000,
+        fidelity=0.0,
+        excitation_type='Karplus-Strong',
+        rng=None,
+        seed=None,
+    ):
         """
         Generate new audio
 
@@ -3105,13 +3196,24 @@ class SpectralStateGuidedSynthesis:
                      0.5 = balanced mix showing variance
             excitation_type: Type of excitation ('Karplus-Strong' or 'Wavelet')
 
+        Args:
+            rng: Optional NumPy random generator for deterministic excitation.
+            seed: Optional seed used if rng is not provided.
+
         Returns:
             Generated audio signal
         """
         print("Phase 2: Inference (Audio Generation)")
         print("=" * 50)
 
-        return self.synthesize_audio(duration_seconds, sample_rate, fidelity=fidelity, excitation_type=excitation_type)
+        return self.synthesize_audio(
+            duration_seconds,
+            sample_rate,
+            fidelity=fidelity,
+            excitation_type=excitation_type,
+            rng=rng,
+            seed=seed,
+        )
 
 
 def example_usage():

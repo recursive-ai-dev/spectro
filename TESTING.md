@@ -55,6 +55,37 @@ pytest -q test_ssgs.py::test_astar_vs_viterbi_decoding
 ## Expected Outcomes
 - A* decoding returns a path with spectral smoothness cost **≤** Viterbi.
 - The decoder remains deterministic and reproducible for the same trained model.
+# Production Hardening Tests
+
+## Purpose
+Ensure deterministic test signals, explicit error paths, and checkpoint validation work as intended.
+
+## Tests Implemented
+### 1) Deterministic Signal Generation
+**Scripts:** `test_generative_capabilities.py`, `test_checkpoints.py`, `test_adaptive_persistence.py`, `test_ssgs.py`, `test_data_indexing.py`
+- All test signal generators now accept seeded RNGs.
+- Each test passes a fixed seed to guarantee reproducibility.
+
+### 2) Empty-Frame Guard for HMM Initialization
+**Script:** `test_data_indexing.py`
+- Creates a model with empty LPC coefficients and asserts `initialize_hmm_parameters` raises a descriptive `ValueError`.
+
+### 3) Missing Tensor Validation for Checkpoints
+**Script:** `test_checkpoints.py`
+- Saves a safetensors checkpoint missing `state_covariances`.
+- Confirms `load_checkpoint` rejects the file with an explicit error.
+
+## How to Run
+```bash
+python test_data_indexing.py
+python test_checkpoints.py
+python test_generative_capabilities.py
+```
+
+## Expected Outcomes
+- Signal generation is repeatable across runs when the same seeds are used.
+- Empty feature inputs fail fast with a clear error.
+- Missing checkpoint tensors are rejected before model reconstruction begins.
 
 ---
 
