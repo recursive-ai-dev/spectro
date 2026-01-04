@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Model checkpoints and outputs
+models/
+outputs/
+uploaded_checkpoints/
+*.safetensors
+*.npz
+*.wav
