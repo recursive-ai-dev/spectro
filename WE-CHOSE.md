@@ -126,3 +126,37 @@ We updated the README to reduce ambiguity, reflect real entry points, and preser
 ## Decision Summary
 We chose lexicographic decoding to honor smoothness claims, keep the logic readable, and deliver the most coherent output for listeners.
 We chose strict validation and deterministic test signals because they simultaneously improve operational reliability, developer productivity, and end-user confidence.
+
+---
+
+# AR(4) Recovery + Psychoacoustic Guard — Perspective Mapping
+
+### CEO Perspective (Reliability + Evidence)
+**Goal:** Provide measurable proof that the model can recover known dynamics.
+
+**Choice:** Added a deterministic AR(4) recovery test with explicit coefficient assertions.
+- **Mapping:** LOGIC-MAP AR(4) Chain B and C.
+- **Why:** Quantitative recovery checks provide a clear, defensible claim of numerical correctness.
+
+---
+
+### Junior Developer Perspective (Debuggability + Safety)
+**Goal:** Make edge-case failures easy to detect and diagnose.
+
+**Choice:** Normalize psychoacoustic weights with a strict epsilon guard to avoid divide-by-zero behavior.
+- **Mapping:** LOGIC-MAP AR(4) Chain A.
+- **Why:** Prevents silent NaNs and makes normalization behavior deterministic.
+
+---
+
+### End-Customer Perspective (Consistency + Trust)
+**Goal:** Ensure stable, predictable output even when perceptual features are flat.
+
+**Choice:** Guarded psychoacoustic normalization and a recovery test that validates the model’s core estimation path.
+- **Mapping:** LOGIC-MAP AR(4) Chain A and C.
+- **Why:** Guarantees consistent weighting and provides evidence that the model is learning meaningful spectral structure.
+
+---
+
+## Decision Summary
+We chose the AR(4) recovery test and psychoacoustic normalization guard because they jointly deliver measurable correctness, safer numerical behavior, and clearer evidence of model reliability.

@@ -55,6 +55,28 @@ pytest -q test_ssgs.py::test_astar_vs_viterbi_decoding
 ## Expected Outcomes
 - A* decoding returns a path with spectral smoothness cost **≤** Viterbi.
 - The decoder remains deterministic and reproducible for the same trained model.
+
+---
+
+# TESTING — AR(4) Recovery Coverage
+
+## Purpose
+Validate the LPC/HMM estimation pipeline by recovering known AR(4) coefficients from a synthetic process.
+
+## Tests Implemented
+### 1) AR(4) Coefficient Recovery
+**Script:** `test_ar_process.py` (`test_ar4_recovery_with_single_state`)
+- Generates a stable AR(4) signal with Gaussian noise.
+- Trains a single-state HMM with `lpc_order=4`.
+- Asserts the recovered LPC mean matches `-a` within ±0.05.
+
+## How to Run
+```bash
+pytest -q test_ar_process.py
+```
+
+## Expected Outcomes
+- The recovered LPC mean is within ±0.05 of the ground-truth coefficients.
 # Production Hardening Tests
 
 ## Purpose

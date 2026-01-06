@@ -182,3 +182,48 @@ Ensure production safety through explicit guardrails (empty inputs, corrupted ch
 ## Result
 Smoothness-aware decoding now respects the intended heuristic, producing a path whose spectral smoothness is never worse than a transition-only decode while still honoring probabilistic transition structure.
 The model now fails safely on empty data, resists corrupted checkpoint loads, and uses deterministic test signals to preserve repeatable, mathematically meaningful validation.
+
+---
+
+# LOGIC-MAP — AR(4) Recovery + Psychoacoustic Normalization Guard
+
+## Purpose
+Fix psychoacoustic normalization edge cases and add a mathematically grounded AR(4) recovery test to verify LPC/HMM estimation correctness on a known stochastic process.
+
+## Logic Chains (Steps 1–3)
+
+### Chain A — Psychoacoustic Normalization Stability (Step 1)
+**Why:** Psychoacoustic weighting should remain bounded even when all features are equal, preventing divide-by-zero and NaNs.
+
+**How:**
+1. Compute the combined proxy vector (`reconstruction` + `psychoacoustic` terms).
+2. Normalize by `max(combined_max, 1e-12)` to guarantee a positive denominator.
+
+**Mathematical rigor:** The normalization becomes a well-defined scaling for all finite inputs, preserving relative weights while preventing undefined ratios.
+
+---
+
+### Chain B — AR(4) Process as Ground-Truth Generator (Step 2)
+**Why:** An AR(4) process has known coefficients, enabling a direct, quantitative check of LPC parameter recovery.
+
+**How:**
+1. Generate an AR(4) signal with stable coefficients and controlled Gaussian noise.
+2. Use a single-state HMM so the model mean is the global LPC estimate.
+
+**Mathematical rigor:** The LPC coefficients for an AR process are the prediction-error filter coefficients `[1, -a₁, -a₂, -a₃, -a₄]`. Comparing recovered means to `-a` validates the estimator directly.
+
+---
+
+### Chain C — Recovery Assertion (Step 3)
+**Why:** Without a numeric tolerance check, regressions in EM or LPC extraction could go unnoticed.
+
+**How:**
+1. Train on the AR(4) signal with `lpc_order=4` and `n_states=1`.
+2. Assert `|μ_est - (-a)| ≤ 0.05` for each coefficient.
+
+**Mathematical rigor:** The tolerance bounds the estimation error against a known process, validating the correctness of the LPC pipeline and HMM emission statistics.
+
+---
+
+## Result
+Psychoacoustic normalization is now numerically safe for degenerate inputs, and the new AR(4) test provides a deterministic, quantitative regression check for LPC coefficient recovery.
