@@ -1581,9 +1581,8 @@ class SpectralStateGuidedSynthesis:
 
         combined = 0.6 * recon_error + 0.4 * psycho_proxy
         combined -= combined.min()
-        combined_max = combined.max()
-        if combined_max > 0.0:
-            combined /= combined_max
+        combined_max = float(combined.max())
+        combined /= max(combined_max, 1e-12)
         self._caches.psychoacoustic_weight = combined
         return combined
 
