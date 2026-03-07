@@ -20,6 +20,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -132,6 +133,41 @@ class _AdaptiveStatistics:
     initial_counts: np.ndarray
     total_frames: float
     last_adaptation: Optional[str] = None
+
+
+class SynthesisError(Exception):
+    """Typed error for synthesis pipeline failures."""
+    
+    class ErrorType(Enum):
+        INVALID_PARAMETER = "invalid_parameter"
+        MODEL_NOT_TRAINED = "model_not_trained"
+        NUMERICAL_INSTABILITY = "numerical_instability"
+        EXCITATION_FAILED = "excitation_failed"
+        INTERNAL_ERROR = "internal_error"
+    
+    def __init__(
+        self,
+        message: str,
+        error_type: ErrorType = ErrorType.INTERNAL_ERROR,
+        correlation_id: Optional[str] = None,
+        cause: Optional[Exception] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.error_type = error_type
+        self.correlation_id = correlation_id
+        self.cause = cause
+    
+    def __str__(self) -> str:
+        base = f"[{self.error_type.value}] {self.message}"
+        if self.correlation_id:
+            base = f"{base} (correlation_id={self.correlation_id})"
+        if self.cause:
+            base = f"{base}. Caused by: {self.cause}"
+        return base
+
+
+from enum import Enum
 
 
 class SpectralStateGuidedSynthesis:
@@ -2313,6 +2349,7 @@ class SpectralStateGuidedSynthesis:
         excitation_type='Karplus-Strong',
         rng=None,
         seed=None,
+        correlation_id=None,
     ):
         """
         Phase 2: Complete Audio Synthesis Pipeline
@@ -2326,57 +2363,93 @@ class SpectralStateGuidedSynthesis:
                      Values in between blend both approaches
             excitation_type: Type of excitation for synthesis ('Karplus-Strong' or 'Wavelet')
                            Only used when fidelity < 1.0
-
-        Args:
             rng: Optional NumPy random generator for deterministic excitation.
             seed: Optional seed used if rng is not provided.
+            correlation_id: Optional identifier for tracing this synthesis request.
 
         Returns:
             audio_output: Generated audio signal
+
+        Raises:
+            SynthesisError: If synthesis fails due to model or parameter issues.
+            ValueError: If input parameters are invalid.
         """
+        import time
+        import uuid
+
+        start_time = time.perf_counter()
+        correlation_id = correlation_id or str(uuid.uuid4())[:8]
+
+        def _log(level: str, step: str, message: str, **kwargs):
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            log_fields = {
+                "correlation_id": correlation_id,
+                "chain_name": "synthesize_audio",
+                "chain_version": "1.0",
+                "step": step,
+                "outcome": level,
+                "latency_ms": round(latency_ms, 2),
+            }
+            log_fields.update(kwargs)
+            logger.log(
+                logging.DEBUG if level == "start" else logging.INFO,
+                f"[{correlation_id}] {step}: {message} | {log_fields}"
+            )
+
+        _log("start", "init", "Starting synthesis pipeline",
+             target_duration_s=target_duration_seconds,
+             sample_rate=sample_rate,
+             fidelity=fidelity,
+             excitation_type=excitation_type)
+
         if self.transition_matrix is None:
+            _log("error", "validate", "Model not trained", outcome="error")
             raise ValueError("Must train the model first using extract_features() and iterative_refinement()")
 
         if not 0.0 <= fidelity <= 1.0:
+            _log("error", "validate", f"Invalid fidelity: {fidelity}", outcome="error")
             raise ValueError("fidelity must be between 0.0 and 1.0")
         
         if excitation_type not in ['Karplus-Strong', 'Wavelet']:
+            _log("error", "validate", f"Invalid excitation_type: {excitation_type}", outcome="error")
             raise ValueError("excitation_type must be 'Karplus-Strong' or 'Wavelet'")
 
         target_frames = int(target_duration_seconds * sample_rate / self.hop_size)
-        print(f"Synthesizing {target_duration_seconds}s of audio ({target_frames} frames)")
-        print(f"Fidelity: {fidelity:.2f} (0.0=synthetic, 1.0=reconstruction)")
+        logger.info(f"[{correlation_id}] Synthesizing {target_duration_seconds}s of audio ({target_frames} frames)")
+        logger.info(f"[{correlation_id}] Fidelity: {fidelity:.2f} (0.0=synthetic, 1.0=reconstruction)")
         if fidelity < 1.0:
-            print(f"Excitation type: {excitation_type}")
+            logger.info(f"[{correlation_id}] Excitation type: {excitation_type}")
 
-        # Step 5: Decode optimal state sequence using A* search
-        print("Step 5: Decoding state sequence with A* search...")
+        _log("progress", "decode", "Starting A* state sequence decode",
+             target_frames=target_frames)
         state_sequence = self._a_star_search(target_frames)
+        _log("progress", "decode", "A* decode complete",
+             n_states=len(set(state_sequence)))
 
         audio_output = np.zeros(target_frames * self.hop_size, dtype=np.float32)
         rng = rng or np.random.default_rng(seed)
 
-        print("Step 6-8: Generating excitation, synthesizing audio...")
+        logger.info(f"[{correlation_id}] Generating excitation, synthesizing audio...")
+
+        nan_detected = False
+        inf_detected = False
         for idx, state in enumerate(state_sequence):
             if fidelity >= 1.0:
-                # Pure reconstruction mode: use training residuals only
                 excitation = self._get_training_residual_for_state(state, rng)
             elif fidelity <= 0.0:
-                # Pure synthetic mode: use selected excitation type
                 if excitation_type == 'Karplus-Strong':
                     excitation = self._karplus_strong_excitation(
                         state,
                         self.hop_size,
                         rng=rng,
                     )
-                else:  # Wavelet
+                else:
                     excitation = self._wavelet_excitation(
                         state,
                         self.hop_size,
                         rng=rng,
                     )
             else:
-                # Blend mode: mix both approaches
                 residual_excitation = self._get_training_residual_for_state(state, rng)
                 if excitation_type == 'Karplus-Strong':
                     synthetic_excitation = self._karplus_strong_excitation(
@@ -2384,13 +2457,12 @@ class SpectralStateGuidedSynthesis:
                         self.hop_size,
                         rng=rng,
                     )
-                else:  # Wavelet
+                else:
                     synthetic_excitation = self._wavelet_excitation(
                         state,
                         self.hop_size,
                         rng=rng,
                     )
-                # Linear blend based on fidelity parameter
                 excitation = (fidelity * residual_excitation +
                             (1.0 - fidelity) * synthetic_excitation)
 
@@ -2403,6 +2475,23 @@ class SpectralStateGuidedSynthesis:
         audio_output *= window
 
         audio_output = self._apply_gain_floor(audio_output, minimum_peak=0.75, target_peak=0.9)
+
+        nan_count = np.sum(np.isnan(audio_output))
+        inf_count = np.sum(np.isinf(audio_output))
+        if nan_count > 0 or inf_count > 0:
+            nan_detected = nan_count > 0
+            inf_detected = inf_count > 0
+            _log("error", "validate", f"Output contains NaN/Inf: nan={nan_count}, inf={inf_count}",
+                 outcome="error", nan_count=nan_count, inf_count=inf_count)
+            audio_output = np.nan_to_num(audio_output, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        total_latency_ms = (time.perf_counter() - start_time) * 1000
+        _log("end", "complete", "Synthesis complete",
+             output_samples=len(audio_output),
+             has_nan=nan_detected,
+             has_inf=inf_detected,
+             latency_ms=round(total_latency_ms, 2))
+
         return audio_output.astype(np.float32)
     
     def export_model(
@@ -3182,6 +3271,7 @@ class SpectralStateGuidedSynthesis:
         excitation_type='Karplus-Strong',
         rng=None,
         seed=None,
+        correlation_id=None,
     ):
         """
         Generate new audio
@@ -3194,10 +3284,9 @@ class SpectralStateGuidedSynthesis:
                      1.0 = high fidelity reconstruction of training audio
                      0.5 = balanced mix showing variance
             excitation_type: Type of excitation ('Karplus-Strong' or 'Wavelet')
-
-        Args:
             rng: Optional NumPy random generator for deterministic excitation.
             seed: Optional seed used if rng is not provided.
+            correlation_id: Optional identifier for tracing this generation request.
 
         Returns:
             Generated audio signal
@@ -3212,6 +3301,7 @@ class SpectralStateGuidedSynthesis:
             excitation_type=excitation_type,
             rng=rng,
             seed=seed,
+            correlation_id=correlation_id,
         )
 
 
