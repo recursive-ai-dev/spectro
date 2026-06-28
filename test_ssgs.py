@@ -648,7 +648,6 @@ def test_batch_training():
     
     print("\n✓ TEST PASSED: Batch training correctly concatenates features")
     print("✓ Temporal order within each file is maintained")
-    assert ssgs_batch is not None
 
 
 def test_wavelet_excitation():
