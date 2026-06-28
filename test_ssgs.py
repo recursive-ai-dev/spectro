@@ -364,7 +364,6 @@ def test_astar_vs_viterbi_decoding():
     print("✓ Cost function verified: cost = -log(L) + smoothness_weight * smoothness + 0.25 * psycho_weight")
     
     print("\n✓ TEST PASSED: A* decoder correctly implements smoothness-aware decoding")
-    return None
 
 
 def test_state_pruning_and_renormalization():
