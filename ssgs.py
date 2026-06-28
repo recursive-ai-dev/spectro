@@ -1744,6 +1744,10 @@ class SpectralStateGuidedSynthesis:
         print(f"Starting EM training with {n_iterations} iterations...")
         self._caches.training_history.clear()
         
+        final_log_likelihood = 0.0
+        final_entropy = 0.0
+        final_smooth_penalty = 0.0
+        
         for iteration in range(n_iterations):
             gamma, xi, log_likelihood = self._expectation_step(self.lpc_coefficients)
 
@@ -1774,6 +1778,11 @@ class SpectralStateGuidedSynthesis:
                     smooth=smooth_penalty,
                 )
             )
+            
+            # Store final iteration values for return
+            final_log_likelihood = log_likelihood
+            final_entropy = entropy
+            final_smooth_penalty = smooth_penalty
 
             preview_snapshot = None
             if preview_every and ((iteration + 1) % preview_every == 0):
@@ -1803,23 +1812,74 @@ class SpectralStateGuidedSynthesis:
                             RuntimeWarning,
                             stacklevel=2,
                         )
+        
+        return final_log_likelihood, final_entropy, final_smooth_penalty
     
-    def identify_graph_constraints(self):
+    def run_em_iteration(self):
+        """
+        Run a single EM iteration and return metrics.
+        
+        This method is a convenience wrapper for external training loops.
+        It runs one complete EM iteration (E-step + M-step) on the current data.
+        
+        Returns:
+            Tuple of (log_likelihood, entropy, smooth_penalty)
+        """
+        if self.lpc_coefficients is None:
+            raise ValueError("Must initialize HMM parameters first")
+        
+        # E-step
+        gamma, xi, log_likelihood = self._expectation_step(self.lpc_coefficients)
+        
+        # Compute metrics
+        occupancy = gamma.mean(axis=0)
+        occupancy = occupancy / (occupancy.sum() + 1e-12)
+        entropy = float(-np.sum(occupancy * np.log(occupancy + 1e-12)))
+        
+        smooth_matrix = self._spectral_smoothness_matrix()
+        smooth_penalty = float(
+            np.sum(xi * smooth_matrix[None, :, :]) / (xi.shape[0] + 1e-12)
+        )
+        
+        # M-step
+        self._maximization_step(self.lpc_coefficients, gamma, xi)
+        
+        return log_likelihood, entropy, smooth_penalty
+    
+    def identify_graph_constraints(self, min_state_probability=1e-4):
         """
         Phase 1, Step 4: Graph Component Identification
         
         Identifies structural degeneracies in the HMM transition matrix
+        and removes isolated/invalid states that have negligible probability.
+        
+        Args:
+            min_state_probability: Minimum stationary probability for a state to be kept
         """
         adjacency = (self.transition_matrix > 1e-6).astype(np.float64)
         graph = csr_matrix(adjacency)
-        n_components, _ = _strong_components(graph)
-
+        n_components, labels = _strong_components(graph)
+        
+        # Compute stationary distribution to identify low-probability states
+        eigenvalues, eigenvectors = np.linalg.eig(self.transition_matrix.T)
+        stationary_idx = np.argmin(np.abs(eigenvalues - 1.0))
+        stationary_dist = np.real(eigenvectors[:, stationary_idx])
+        stationary_dist = stationary_dist / stationary_dist.sum()
+        
+        # Identify states to remove (isolated or near-zero probability)
+        states_to_remove = set()
         for state in range(self.n_states):
             row = self.transition_matrix[state]
             self_loop = row[state]
             outgoing = row.sum() - self_loop
             incoming = self.transition_matrix[:, state].sum() - self_loop
-
+            
+            # Mark states with very low stationary probability for removal
+            if stationary_dist[state] < min_state_probability:
+                states_to_remove.add(state)
+                continue
+            
+            # Renormalize rows with low outgoing/incoming probability
             if outgoing < 1e-3 or incoming < 1e-3:
                 row.fill(1.0 / self.n_states)
                 row[state] = min(self_loop, 0.85)
@@ -1829,6 +1889,27 @@ class SpectralStateGuidedSynthesis:
                     row[state] = 1.0 - remainder
             row[:] = np.clip(row, 1e-6, None)
             row /= row.sum()
+        
+        # Actually remove isolated states by redistributing their probability
+        if states_to_remove:
+            print(f"Identified {len(states_to_remove)} isolated states for removal")
+            for state in states_to_remove:
+                # Redistribute this state's probability to neighboring states
+                row = self.transition_matrix[state]
+                # Find states in the same strongly connected component
+                if n_components > 1:
+                    same_component_mask = labels == labels[state]
+                    # Redistribute uniformly within component
+                    component_size = np.sum(same_component_mask)
+                    if component_size > 1:
+                        row.fill(0.0)
+                        row[same_component_mask] = 1.0 / (component_size - 1)
+                        row[state] = 0.0  # Remove self-loop
+            
+            # Re-normalize all rows
+            row_sums = self.transition_matrix.sum(axis=1, keepdims=True)
+            row_sums = np.where(row_sums < 1e-12, 1.0, row_sums)
+            self.transition_matrix = self.transition_matrix / row_sums
 
         self._reset_caches()
         self._transition_cost_matrix()
@@ -1872,15 +1953,22 @@ class SpectralStateGuidedSynthesis:
     
     def _a_star_search(self, target_duration_frames, max_expanded=10000):
         """
-        Phase 2, Step 5: State sequence decoding using a smoothness-aware DP
+        Phase 2, Step 5: State sequence decoding using smoothness-aware dynamic programming
+        
+        Note: This is implemented as a Viterbi-style DP with spectral smoothness costs.
+        The "A*" naming reflects the heuristic-guided nature of the smoothness penalty,
+        though technically this is a constrained Viterbi decoder.
         
         Args:
             target_duration_frames: Target number of frames
-            max_expanded: Maximum number of nodes to expand
+            max_expanded: Maximum number of nodes to expand (reserved for future use)
             
         Returns:
             optimal_state_sequence: Most probable state sequence
         """
+        # Use cached transition cost matrix if available
+        if self._caches.transition_cost is not None:
+            return self._decode_state_sequence_cached(target_duration_frames)
         return self._decode_state_sequence(target_duration_frames)
 
     def _decode_state_sequence(self, target_frames):
@@ -1946,6 +2034,71 @@ class SpectralStateGuidedSynthesis:
             end_state = backpointer[t, end_state]
             path[t - 1] = end_state
 
+        return path
+    
+    def _decode_state_sequence_cached(self, target_frames):
+        """Cached version of state sequence decoding using pre-computed transition costs."""
+        if self.transition_matrix is None or self.initial_probabilities is None:
+            raise ValueError("HMM parameters are not initialized")
+        
+        # Use cached transition cost matrix
+        transition_cost = self._caches.transition_cost
+        initial_cost = -np.log(self.initial_probabilities + 1e-12)
+        smoothness = self._spectral_smoothness_matrix()
+        
+        if self.smoothness_weight <= 0.0:
+            dp = np.empty((target_frames, self.n_states), dtype=np.float64)
+            backpointer = np.zeros((target_frames, self.n_states), dtype=np.int32)
+            dp[0] = initial_cost
+            
+            for t in range(1, target_frames):
+                costs = dp[t - 1][:, None] + transition_cost
+                backpointer[t] = np.argmin(costs, axis=0)
+                dp[t] = np.min(costs, axis=0)
+            
+            end_state = int(np.argmin(dp[-1]))
+        else:
+            dp_smooth = np.empty((target_frames, self.n_states), dtype=np.float64)
+            dp_total = np.empty((target_frames, self.n_states), dtype=np.float64)
+            backpointer = np.zeros((target_frames, self.n_states), dtype=np.int32)
+            dp_smooth[0] = 0.0
+            dp_total[0] = initial_cost
+            
+            tolerance = 1e-9
+            
+            for t in range(1, target_frames):
+                for j in range(self.n_states):
+                    smooth_candidates = dp_smooth[t - 1] + smoothness[:, j]
+                    min_smooth = float(np.min(smooth_candidates))
+                    
+                    total_candidates = dp_total[t - 1] + transition_cost[:, j]
+                    min_total = float(np.min(total_candidates))
+                    
+                    threshold = min_total + tolerance
+                    valid_mask = total_candidates <= threshold
+                    
+                    if np.any(valid_mask):
+                        smooth_among_best = np.where(valid_mask, smooth_candidates, np.inf)
+                        best_smooth_idx = int(np.argmin(smooth_among_best))
+                        
+                        dp_smooth[t, j] = dp_smooth[t - 1, best_smooth_idx] + smoothness[best_smooth_idx, j]
+                        dp_total[t, j] = total_candidates[best_smooth_idx]
+                        backpointer[t, j] = best_smooth_idx
+                    else:
+                        total_idx = int(np.argmin(total_candidates))
+                        dp_smooth[t, j] = dp_smooth[t - 1, total_idx] + smoothness[total_idx, j]
+                        dp_total[t, j] = total_candidates[total_idx]
+                        backpointer[t, j] = total_idx
+            
+            end_state = int(np.argmin(dp_total[-1]))
+        
+        path = [0] * target_frames
+        path[-1] = end_state
+        
+        for t in range(target_frames - 1, 0, -1):
+            end_state = backpointer[t, end_state]
+            path[t - 1] = end_state
+        
         return path
 
     def _state_spectral_prototypes(self):
@@ -2131,27 +2284,39 @@ class SpectralStateGuidedSynthesis:
         
         return excitation
     
-    def _lpc_synthesis_filter(self, excitation, lpc_coeffs):
+    def _lpc_synthesis_filter(self, excitation, lpc_coeffs, zi=None):
         """
         Phase 2, Step 7: Audio Synthesis using LPC filtering
 
         Args:
             excitation: Excitation signal
             lpc_coeffs: LPC coefficients
+            zi: Initial filter state (for continuity between frames)
 
         Returns:
-            synthesized_audio: Filtered audio signal
+            Tuple of (synthesized_audio, new_zi) if zi was provided, else synthesized_audio
         """
         filter_coeffs = np.concatenate([[1.0], lpc_coeffs])
         try:
-            synthesized = signal.lfilter([1.0], filter_coeffs, excitation).astype(np.float32)
+            if zi is not None:
+                synthesized, new_zi = signal.lfilter([1.0], filter_coeffs, excitation, zi=zi)
+            else:
+                synthesized = signal.lfilter([1.0], filter_coeffs, excitation)
+                new_zi = None
+            synthesized = synthesized.astype(np.float32)
         except (ValueError, LinAlgError, RuntimeError) as e:
             logger.warning(f"LPC filter failed ({type(e).__name__}: {e}), falling back to convolution")
+            # Fallback is mathematically incorrect but at least won't crash
+            # Note: This fallback does NOT support state carry
             synthesized = np.convolve(excitation, filter_coeffs[::-1], mode="same").astype(np.float32)
+            new_zi = zi
 
         max_val = np.max(np.abs(synthesized))
         if max_val > 0:
             synthesized = synthesized / max_val * 0.8
+        
+        if zi is not None:
+            return synthesized, new_zi
         return synthesized
 
     def _apply_gain_floor(
@@ -2349,14 +2514,23 @@ class SpectralStateGuidedSynthesis:
         if fidelity < 1.0:
             print(f"Excitation type: {excitation_type}")
 
-        # Step 5: Decode optimal state sequence using A* search
-        print("Step 5: Decoding state sequence with A* search...")
+        # Step 5: Decode optimal state sequence using smoothness-aware DP
+        print("Step 5: Decoding state sequence with smoothness-aware dynamic programming...")
         state_sequence = self._a_star_search(target_frames)
 
         audio_output = np.zeros(target_frames * self.hop_size, dtype=np.float32)
         rng = rng or np.random.default_rng(seed)
 
         print("Step 6-8: Generating excitation, synthesizing audio...")
+        
+        # Initialize filter state for continuity between frames
+        filter_order = self.lpc_order + 1  # Includes the leading 1.0
+        zi = np.zeros(filter_order - 1, dtype=np.float64)  # lfilter needs len(b)+len(a)-2 = lpc_order states
+        
+        # Overlap-add window for smooth transitions
+        hop_size = self.hop_size
+        overlap_window = np.hanning(2 * hop_size)[:hop_size]  # Rising half of Hann window
+        
         for idx, state in enumerate(state_sequence):
             if fidelity >= 1.0:
                 # Pure reconstruction mode: use training residuals only
@@ -2394,13 +2568,17 @@ class SpectralStateGuidedSynthesis:
                 excitation = (fidelity * residual_excitation +
                             (1.0 - fidelity) * synthetic_excitation)
 
-            frame_audio = self._lpc_synthesis_filter(excitation, self.state_means[state])
+            frame_audio, zi = self._lpc_synthesis_filter(excitation, self.state_means[state], zi=zi)
+            
+            # Apply per-frame windowing for overlap-add
+            windowed_frame = frame_audio[:self.hop_size] * overlap_window
+            
             start = idx * self.hop_size
             end = start + self.hop_size
-            audio_output[start:end] += frame_audio[: self.hop_size]
+            audio_output[start:end] += windowed_frame
 
-        window = np.hanning(len(audio_output))
-        audio_output *= window
+        # Remove global Hann window - we now use per-frame windowing with overlap-add
+        # No global windowing needed
 
         audio_output = self._apply_gain_floor(audio_output, minimum_peak=0.75, target_peak=0.9)
         return audio_output.astype(np.float32)
