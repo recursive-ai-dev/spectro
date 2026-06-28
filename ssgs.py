@@ -388,7 +388,7 @@ class SpectralStateGuidedSynthesis:
         }
 
         if self.lpc_coefficients is not None and len(self.lpc_coefficients) == len(frames):
-            metadata["lpc_norm"] = np.linalg.norm(self.lpc_coefficients, axis=1).astype(
+            metadata["lpc_norm"] = np.linalg.norm(self.lpc_coefficients, axis=1).astype(  # pylint: disable=no-member
                 np.float32, copy=False
             )
 
@@ -399,7 +399,7 @@ class SpectralStateGuidedSynthesis:
         ):
             residual_energy = np.sum(self.residual_signals * self.residual_signals, axis=1)
             residual_rms = np.sqrt(residual_energy / self.residual_signals.shape[1])
-            metadata["residual_rms"] = residual_rms.astype(np.float32, copy=False)
+            metadata["residual_rms"] = residual_rms.astype(np.float32, copy=False)  # pylint: disable=no-member
 
         if sample_rate:
             window = np.hanning(frame_len)
@@ -409,15 +409,15 @@ class SpectralStateGuidedSynthesis:
             power = spectrum + 1e-12
 
             centroid = (power * freqs).sum(axis=1) / power.sum(axis=1)
-            metadata["spectral_centroid"] = centroid.astype(np.float32, copy=False)
+            metadata["spectral_centroid"] = centroid.astype(np.float32, copy=False)  # pylint: disable=no-member
 
             bandwidth = np.sqrt(
                 ((freqs - centroid[:, None]) ** 2 * power).sum(axis=1) / power.sum(axis=1)
             )
-            metadata["spectral_bandwidth"] = bandwidth.astype(np.float32, copy=False)
+            metadata["spectral_bandwidth"] = bandwidth.astype(np.float32, copy=False)  # pylint: disable=no-member
 
             dominant_idx = np.argmax(power, axis=1)
-            metadata["dominant_frequency"] = freqs[dominant_idx].astype(np.float32, copy=False)
+            metadata["dominant_frequency"] = freqs[dominant_idx].astype(np.float32, copy=False)  # pylint: disable=no-member
 
         self.frame_metadata = metadata
 
@@ -436,7 +436,7 @@ class SpectralStateGuidedSynthesis:
                     "Missing frame metadata for extended feature space: " + ", ".join(missing)
                 )
             extras = [
-                self.frame_metadata[key][:, None].astype(np.float64, copy=False)
+                self.frame_metadata[key][:, None].astype(np.float64, copy=False)  # pylint: disable=no-member
                 for key in required_keys
             ]
             matrix = np.hstack([self.lpc_coefficients.astype(np.float64, copy=False)] + extras)
@@ -481,7 +481,7 @@ class SpectralStateGuidedSynthesis:
         if feature_space == "extended" and isinstance(vector, dict):
             if "lpc" not in vector:
                 raise ValueError("Extended queries require an 'lpc' entry in the vector dictionary")
-            parts: Sequence[np.ndarray] = [np.asarray(vector["lpc"], dtype=np.float64)]
+            parts: List[np.ndarray] = [np.asarray(vector["lpc"], dtype=np.float64)]
             for key in index.metadata_keys:
                 if key not in vector:
                     raise ValueError(f"Vector dictionary missing required key '{key}'")
@@ -931,7 +931,7 @@ class SpectralStateGuidedSynthesis:
                 "zero_crossings": zero_crossings.astype(np.int32, copy=False),
             }
             if flux_values.size:
-                frame_metadata["spectral_flux"] = flux_values.astype(np.float32, copy=False)
+                frame_metadata["spectral_flux"] = flux_values.astype(np.float32, copy=False)  # pylint: disable=no-member
 
         return processed_frames, lpc_coeffs, residuals, perceptual_vectors, flux_values, frame_metadata
     
@@ -1363,6 +1363,9 @@ class SpectralStateGuidedSynthesis:
         ) = self._compute_statistics_from_observations(observations, gamma, xi)
 
         stats = self._adaptive_stats
+        if stats is None:
+            return
+
         decay = float(adaptation_rate)
         retain = 1.0 - decay
 
@@ -2686,7 +2689,7 @@ class SpectralStateGuidedSynthesis:
         """Load a serialized model produced by ``export_model``."""
         filepath = Path(filepath)
         with np.load(filepath, allow_pickle=False) as data:
-            metadata = json.loads(data["metadata"].item())
+            metadata = json.loads(data["metadata"].item())  # pylint: disable=no-member
 
             model = cls(
                 n_states=metadata["n_states"],
@@ -2697,19 +2700,19 @@ class SpectralStateGuidedSynthesis:
                 adaptive_memory_limit=metadata.get("adaptive_memory_limit", 6000),
             )
 
-            transition = data["transition_matrix"].astype(np.float64, copy=False)
+            transition = data["transition_matrix"].astype(np.float64, copy=False)  # pylint: disable=no-member
             transition = np.clip(transition, 1e-12, None)
             transition /= transition.sum(axis=1, keepdims=True)
             model.transition_matrix = transition
 
-            init_probs = data["initial_probabilities"].astype(np.float64, copy=False)
+            init_probs = data["initial_probabilities"].astype(np.float64, copy=False)  # pylint: disable=no-member
             init_probs = np.clip(init_probs, 1e-12, None)
             model.initial_probabilities = init_probs / init_probs.sum()
-            model.state_means = data["state_means"].astype(np.float64, copy=False)
+            model.state_means = data["state_means"].astype(np.float64, copy=False)  # pylint: disable=no-member
 
             if metadata.get("pack_covariances", False):
                 tri_rows, tri_cols = np.tril_indices(model.lpc_order)
-                packed = data["state_covariances_packed"].astype(np.float64, copy=False)
+                packed = data["state_covariances_packed"].astype(np.float64, copy=False)  # pylint: disable=no-member
                 full_cov = np.zeros(
                     (model.n_states, model.lpc_order, model.lpc_order),
                     dtype=np.float64,
@@ -2718,24 +2721,24 @@ class SpectralStateGuidedSynthesis:
                 full_cov[:, tri_cols, tri_rows] = packed
                 model.state_covariances = full_cov
             else:
-                model.state_covariances = data["state_covariances"].astype(np.float64, copy=False)
+                model.state_covariances = data["state_covariances"].astype(np.float64, copy=False)  # pylint: disable=no-member
 
             if "training_frames" in data:
-                model.training_frames = data["training_frames"].astype(np.float32, copy=False)
+                model.training_frames = data["training_frames"].astype(np.float32, copy=False)  # pylint: disable=no-member
             if "lpc_coefficients" in data:
-                model.lpc_coefficients = data["lpc_coefficients"].astype(np.float32, copy=False)
+                model.lpc_coefficients = data["lpc_coefficients"].astype(np.float32, copy=False)  # pylint: disable=no-member
             if "residual_signals" in data:
-                model.residual_signals = data["residual_signals"].astype(np.float32, copy=False)
+                model.residual_signals = data["residual_signals"].astype(np.float32, copy=False)  # pylint: disable=no-member
             if "perceptual_features" in data:
-                model.perceptual_features = data["perceptual_features"].astype(np.float32, copy=False)
+                model.perceptual_features = data["perceptual_features"].astype(np.float32, copy=False)  # pylint: disable=no-member
             if "spectral_flux" in data:
-                model.spectral_flux = data["spectral_flux"].astype(np.float32, copy=False)
+                model.spectral_flux = data["spectral_flux"].astype(np.float32, copy=False)  # pylint: disable=no-member
 
             meta_keys = metadata.get("frame_metadata_keys", [])
             if meta_keys:
                 frame_meta: Dict[str, np.ndarray] = {}
                 for key in meta_keys:
-                    frame_meta[key] = data[f"frame_metadata__{key}"].copy()
+                    frame_meta[key] = data[f"frame_metadata__{key}"].copy()  # pylint: disable=no-member
                 model.frame_metadata = frame_meta
             else:
                 model.frame_metadata = {}
@@ -2744,23 +2747,23 @@ class SpectralStateGuidedSynthesis:
 
             if metadata.get("includes_adaptive_statistics") and "adaptive_state_frame_counts" in data:
                 model._adaptive_stats = _AdaptiveStatistics(
-                    state_frame_counts=data["adaptive_state_frame_counts"].astype(
+                    state_frame_counts=data["adaptive_state_frame_counts"].astype(  # pylint: disable=no-member
                         np.float64, copy=False
                     ),
-                    transition_counts=data["adaptive_transition_counts"].astype(
+                    transition_counts=data["adaptive_transition_counts"].astype(  # pylint: disable=no-member
                         np.float64, copy=False
                     ),
-                    mean_accumulator=data["adaptive_mean_accumulator"].astype(
+                    mean_accumulator=data["adaptive_mean_accumulator"].astype(  # pylint: disable=no-member
                         np.float64, copy=False
                     ),
-                    second_moment_accumulator=data["adaptive_second_moment"].astype(
+                    second_moment_accumulator=data["adaptive_second_moment"].astype(  # pylint: disable=no-member
                         np.float64, copy=False
                     ),
-                    initial_counts=data["adaptive_initial_counts"].astype(
+                    initial_counts=data["adaptive_initial_counts"].astype(  # pylint: disable=no-member
                         np.float64, copy=False
                     ),
-                    total_frames=float(data["adaptive_total_frames"].item()),
-                    last_adaptation=data["adaptive_last_adaptation"].item() or None,
+                    total_frames=float(data["adaptive_total_frames"].item()),  # pylint: disable=no-member
+                    last_adaptation=data["adaptive_last_adaptation"].item() or None,  # pylint: disable=no-member
                 )
 
         model._reset_caches()

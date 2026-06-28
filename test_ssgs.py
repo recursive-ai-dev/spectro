@@ -364,7 +364,7 @@ def test_astar_vs_viterbi_decoding():
     print("✓ Cost function verified: cost = -log(L) + smoothness_weight * smoothness + 0.25 * psycho_weight")
     
     print("\n✓ TEST PASSED: A* decoder correctly implements smoothness-aware decoding")
-    return ssgs, astar_path, viterbi_path
+    return None
 
 
 def test_state_pruning_and_renormalization():
@@ -439,7 +439,7 @@ def test_state_pruning_and_renormalization():
     print("✓ No probability mass loss after pruning")
     
     print("\n✓ TEST PASSED: State pruning maintains valid state count and proper normalization")
-    return ssgs
+    return None
 
 
 def test_model_export_import_integrity():
@@ -546,7 +546,8 @@ def test_model_export_import_integrity():
         print("\n✓ TEST PASSED: Model export/import preserves all parameters correctly")
         print("✓ Covariance compression (pack_covariances=True) verified")
     
-    return original_model, loaded_model
+    assert original_model is not None
+    assert loaded_model is not None
 
 
 def test_batch_training():
@@ -648,7 +649,7 @@ def test_batch_training():
     
     print("\n✓ TEST PASSED: Batch training correctly concatenates features")
     print("✓ Temporal order within each file is maintained")
-    return ssgs_batch
+    assert ssgs_batch is not None
 
 
 def test_wavelet_excitation():
@@ -710,7 +711,7 @@ def test_wavelet_excitation():
     
     print("\n✓ TEST PASSED: Wavelet excitation works correctly")
     print("✓ PyWavelets dependency verified")
-    return ssgs, audio_ks, audio_wavelet
+    assert ssgs is not None
 
 
 def test_auto_n_states_selection():
@@ -769,7 +770,7 @@ def test_auto_n_states_selection():
     print(f"✓ Generated {len(audio)} samples")
     
     print("\n✓ TEST PASSED: Auto state selection works correctly")
-    return ssgs
+    assert ssgs is not None
 
 
 if __name__ == "__main__":
