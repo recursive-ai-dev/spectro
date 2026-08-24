@@ -241,6 +241,38 @@ vector_result = ssgs.search_by_feature_vector(
 
 The returned `FrameQueryResult` includes indices, optional distances, and frame metadata.
 
+## Performance: Native Compiled Backend
+
+The numeric hot loops are also implemented as a small, dependency-light C
+library (`ssgs_native.c`) and exposed through `ssgs_native.py`. `ssgs.py`
+automatically uses them when `libssgs_native.so` is loadable, and falls back to
+the existing SciPy/NumPy paths otherwise — so the package still works on a
+machine with no compiler installed.
+
+Kernels covered: LPC (Levinson–Durbin), Gaussian emission (hand Cholesky +
+forward solve), EM forward–backward, and the smoothness-first Viterbi decode.
+The decode is the dominant synthesis cost (a pure-Python triple loop in the
+SciPy build); the compiled kernel is ~170× faster there, with **identical**
+output:
+
+| kernel                | SciPy/NumPy | C          | speedup |
+|-----------------------|-------------|------------|---------|
+| LPC (Levinson–Durbin) | 0.172 s     | 0.172 s    | 1.0×    |
+| Gaussian emission     | 0.0014 s    | 0.0012 s   | 1.2×    |
+| decode (2000 frames)  | 0.4998 s    | 0.0029 s   | 170×    |
+
+The C kernels are numerically identical to `ssgs.py` (enforced by
+`test_regression_guard.py`). Build the library with:
+
+```bash
+make            # produces libssgs_native.so (requires gcc)
+```
+
+A pure-NumPy reference implementation lives in `ssgs_core.py` and is used by the
+regression guard to prove equivalence even when the compiled library is absent.
+
+---
+
 ## Testing
 
 Run individual checks as standalone scripts:
@@ -255,6 +287,14 @@ python test_generative_capabilities.py
 python test_utils.py
 ```
 
+Numeric-equivalence and performance gates:
+
+```bash
+python ssgs_core.py               # pure-NumPy core self-test (equivalence oracle)
+python ssgs_native.py             # compiled-kernel verify + benchmark
+python test_regression_guard.py   # native load + core/pipeline equivalence
+```
+
 
 ### Requirements
 
@@ -267,9 +307,15 @@ PyWavelets>=1.1.0
 safetensors>=0.4.0
 ```
 
+Optional: `gcc` and `make` to build the native backend (`libssgs_native.so`).
+If unavailable, SSGS falls back to the SciPy/NumPy paths automatically.
+
 ### Project Structure
 
 ssgs.py                        # Full model implementation \
+ssgs_core.py                   # Pure-NumPy reference kernels (equivalence oracle) \
+ssgs_native.c                  # Compiled C kernels (Levinson-Durbin, emission, EM, decode) \
+ssgs_native.py                 # ctypes wrapper + benchmark for the C kernels \
 train_on_folder.py             # Folder-based training with checkpointing \
 demo_enhanced_capabilities.py  # State-count showcase \
 example_checkpoints.py         # Checkpoint usage example \
@@ -280,6 +326,8 @@ test_adaptive_persistence.py   # Adaptive learning tests \
 test_data_indexing.py          # Feature index tests \
 test_gain_control.py           # Gain control tests \
 test_generative_capabilities.py # State-count tests \
+test_regression_guard.py       # Native load + core/pipeline equivalence guard \
+Makefile                       # Builds libssgs_native.so \
 requirements.txt               # Dependencies \
 ssgs_demo.png                  # Example output \
 ssgs_analysis.png              # Diagnostic output \
