@@ -37,3 +37,5 @@ coverage/
 .pytest_cache/
 .mypy_cache/
 ```
+# Built shared library (platform-specific; rebuild via `make`)
+libssgs_native.so
