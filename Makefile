@@ -7,6 +7,9 @@ CFLAGS ?= -shared -fPIC -O3
 libssgs_native.so: ssgs_native.c
 	$(CC) $(CFLAGS) -o $@ ssgs_native.c -lm
 
-.PHONY: clean
+.PHONY: clean rebuild
 clean:
 	rm -f libssgs_native.so
+
+rebuild: clean
+	$(MAKE) libssgs_native.so

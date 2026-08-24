@@ -321,6 +321,17 @@ def _self_test():
     assert ref_path == core_path, "Decode mismatch"
     print("  [ok] Smoothness decode matches ssgs (cached)")
 
+    # 4) Forward-backward equivalence
+    emit = m._compute_emission_log_probs(obs[:20])
+    init = np.log(m.initial_probabilities + 1e-12)
+    trans = np.log(m.transition_matrix + 1e-12)
+    core_gamma, core_xi, core_ll = forward_backward(emit, init, trans)
+    native_gamma, native_xi, native_ll = m._expectation_step(obs[:20])
+    assert np.allclose(core_gamma, native_gamma, atol=1e-3), "Gamma mismatch"
+    assert np.allclose(core_xi, native_xi, atol=1e-3), "Xi mismatch"
+    assert abs(core_ll - native_ll) < 1e-3, "Log-likelihood mismatch"
+    print("  [ok] Forward-backward (core) matches ssgs._expectation_step")
+
     print("ALL CORE SELF-TESTS PASSED")
 
 

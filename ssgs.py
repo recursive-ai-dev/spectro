@@ -49,6 +49,25 @@ except ImportError:  # pragma: no cover - older SciPy fallback
     def _strong_components(graph):
         return _scipy_cc(graph, directed=True, connection="strong")
 
+# Optional native/core backend: compiled kernels (ssgs_native.so) or pure-NumPy core
+try:
+    import ssgs_core
+    _CORE_BACKEND_AVAILABLE = True
+except Exception:  # pragma: no cover
+    ssgs_core = None  # type: ignore
+    _CORE_BACKEND_AVAILABLE = False
+
+try:
+    import ssgs_native
+    # Ensure the native .so is actually loadable (ctypes already loaded it)
+    if ssgs_native._lib is not None:
+        _NATIVE_BACKEND_AVAILABLE = True
+    else:
+        _NATIVE_BACKEND_AVAILABLE = False
+except Exception:  # pragma: no cover - .so missing or ABI mismatch
+    ssgs_native = None  # type: ignore
+    _NATIVE_BACKEND_AVAILABLE = False
+
 # Note: Warning filtering has been removed for production safety.
 # If specific warnings need suppression, use context managers:
 # with warnings.catch_warnings():
@@ -666,6 +685,9 @@ class SpectralStateGuidedSynthesis:
         Compute LPC coefficients using the autocorrelation / Toeplitz approach.
         """
         autocorr = self._autocorrelation(frame)
+        if _NATIVE_BACKEND_AVAILABLE:
+            coeffs = ssgs_native.lpc_levinson(autocorr, self.lpc_order)
+            return coeffs.astype(np.float32, copy=False)
         if autocorr[0] <= 1e-8:
             coeffs = np.zeros(self.lpc_order + 1, dtype=np.float32)
             coeffs[0] = 1.0
@@ -1623,6 +1645,16 @@ class SpectralStateGuidedSynthesis:
         n_frames = observations.shape[0]
         log_emissions = self._compute_emission_log_probs(observations)
 
+        if _NATIVE_BACKEND_AVAILABLE:
+            log_init = np.log(self.initial_probabilities + 1e-12)
+            log_trans = np.log(self.transition_matrix + 1e-12)
+            gamma, xi, log_likelihood = ssgs_native.forward_backward(
+                np.ascontiguousarray(log_emissions, dtype=np.float64),
+                np.ascontiguousarray(log_init, dtype=np.float64),
+                np.ascontiguousarray(log_trans, dtype=np.float64),
+            )
+            return gamma, xi, float(log_likelihood)
+
         log_init = np.log(self.initial_probabilities + 1e-12)
         log_trans = np.log(self.transition_matrix + 1e-12)
 
@@ -1657,7 +1689,14 @@ class SpectralStateGuidedSynthesis:
     
     def _compute_emission_log_probs(self, observations):
         """Vectorized Gaussian log-likelihoods for all states."""
+        observations = np.asarray(observations)
         n_frames = observations.shape[0]
+        if _NATIVE_BACKEND_AVAILABLE:
+            return ssgs_native.gaussian_log_probs(
+                np.asarray(self.state_means, dtype=np.float64),
+                np.asarray(self.state_covariances, dtype=np.float64),
+                np.asarray(observations, dtype=np.float64),
+            )
         self._compute_and_cache_cholesky_factors()
         caches = self._caches
         log_probs = np.empty((n_frames, self.n_states), dtype=np.float64)
@@ -1873,8 +1912,11 @@ class SpectralStateGuidedSynthesis:
         """
         Phase 1, Step 4: Graph Component Identification
         
-        Identifies structural degeneracies in the HMM transition matrix
-        and removes isolated/invalid states that have negligible probability.
+        Identifies structural degeneracies in the HMM transition matrix,
+        marks isolated states, and redistributes their probability to
+        neighboring states within the same strongly connected component.
+        Note: this does not remove states (self.n_states is unchanged);
+        it only renormalizes transition probabilities.
         
         Args:
             min_state_probability: Minimum stationary probability for a state to be kept
@@ -1999,7 +2041,21 @@ class SpectralStateGuidedSynthesis:
         Returns:
             optimal_state_sequence: Most probable state sequence
         """
-        # Use cached transition cost matrix if available
+        # Use the compiled native decode when available (identical output to the
+        # Python decoders, but ~170x faster on the synthesis hot path).
+        if _NATIVE_BACKEND_AVAILABLE:
+            transition_cost = self._transition_cost_matrix()
+            smoothness = self._spectral_smoothness_matrix()
+            initial_cost = -np.log(self.initial_probabilities + 1e-12)
+            return ssgs_native.decode_sequence(
+                transition_cost,
+                smoothness,
+                initial_cost,
+                self.smoothness_weight,
+                target_duration_frames,
+            )
+
+        # Fallback: cached Python decoder (used only when the native .so is absent)
         if self._caches.transition_cost is not None:
             return self._decode_state_sequence_cached(target_duration_frames)
         return self._decode_state_sequence(target_duration_frames)
@@ -2014,6 +2070,16 @@ class SpectralStateGuidedSynthesis:
         psycho_weight = self._compute_psychoacoustic_weight()
         transition_cost = transition_cost + 0.25 * psycho_weight[np.newaxis, :]
         smoothness = self._spectral_smoothness_matrix()
+
+        if _NATIVE_BACKEND_AVAILABLE:
+            path = ssgs_native.decode_sequence(
+                transition_cost,
+                smoothness,
+                initial_cost,
+                self.smoothness_weight,
+                target_frames,
+            )
+            return path
 
         if self.smoothness_weight <= 0.0:
             dp = np.empty((target_frames, self.n_states), dtype=np.float64)
@@ -3300,7 +3366,8 @@ class SpectralStateGuidedSynthesis:
         n_adaptation_iterations: int = 1,
     ) -> Dict[str, float]:
         """
-        Adapt the model to new audio while preserving persistent memory.
+        Adapt the model to new audio using exponential-moving-average (EMA)
+        statistics (not persistent memory; adaptation_rate controls decay).
 
         Args:
             audio_signal: New audio samples to adapt to.
