@@ -74,6 +74,8 @@ except Exception:  # pragma: no cover - .so missing or ABI mismatch
 #     warnings.filterwarnings('ignore', category=SpecificWarning)
 #     # your code here
 
+_ERR_HMM_NOT_INITIALIZED = "HMM parameters are not initialized"
+
 
 @dataclass
 class FeatureIndex:
@@ -765,7 +767,7 @@ class SpectralStateGuidedSynthesis:
             filters[m - 1, center:end] = down
 
         row_sums = filters.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0.0] = 1.0
+        row_sums[row_sums < 1e-12] = 1.0
         filters /= row_sums
         return filters
 
@@ -809,7 +811,7 @@ class SpectralStateGuidedSynthesis:
             filters[b - 1, center:end] = down
 
         row_sums = filters.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0.0] = 1.0
+        row_sums[row_sums < 1e-12] = 1.0
         filters /= row_sums
         return filters
 
@@ -2070,7 +2072,7 @@ class SpectralStateGuidedSynthesis:
     def _decode_state_sequence(self, target_frames):
         """Deterministic dynamic-programming decode with smoothness-first objective."""
         if self.transition_matrix is None or self.initial_probabilities is None:
-            raise ValueError("HMM parameters are not initialized")
+            raise ValueError(_ERR_HMM_NOT_INITIALIZED)
 
         initial_cost = -np.log(self.initial_probabilities + 1e-12)
         transition_cost = -np.log(self.transition_matrix + 1e-12)
@@ -2151,7 +2153,7 @@ class SpectralStateGuidedSynthesis:
         that term) to preserve the exact smoothness-first lexicographic ordering.
         """
         if self.transition_matrix is None or self.initial_probabilities is None:
-            raise ValueError("HMM parameters are not initialized")
+            raise ValueError(_ERR_HMM_NOT_INITIALIZED)
 
         transition_cost = self._caches.transition_cost
         smoothness = self._spectral_smoothness_matrix()
@@ -2215,7 +2217,7 @@ class SpectralStateGuidedSynthesis:
 
         return path
 
-    def _state_spectral_prototypes(self):
+    def _state_spectral_prototypes(self, rng=None, seed=None):
         if self._caches.spectral_prototypes is not None:
             return self._caches.spectral_prototypes
         if self.state_means is None:
@@ -2227,7 +2229,7 @@ class SpectralStateGuidedSynthesis:
             else None
         )
         assignments = self._estimate_state_assignments()
-        rng = np.random.default_rng()
+        rng = rng or np.random.default_rng(seed)
         prototypes: List[Tuple[np.ndarray, np.ndarray]] = []
 
         for state in range(self.n_states):
@@ -2568,7 +2570,7 @@ class SpectralStateGuidedSynthesis:
 
         return residual.astype(np.float32, copy=True)
 
-    def render_preview(self, n_frames=32, sample_rate=None, state_sequence=None):
+    def render_preview(self, n_frames=32, sample_rate=None, state_sequence=None, rng=None, seed=None):
         """Generate a lightweight audio preview using cached prototypes.
 
         Returns a tuple ``(audio, sample_rate)`` for quick auditioning.
@@ -2579,7 +2581,7 @@ class SpectralStateGuidedSynthesis:
             raise ValueError("n_frames must be positive")
 
         sample_rate = int(sample_rate or (self.sample_rate or 16000))
-        prototypes = self._state_spectral_prototypes()
+        prototypes = self._state_spectral_prototypes(rng=rng, seed=seed)
 
         required_samples = n_frames * self.hop_size
         workspace = self._caches.emission_workspace
@@ -2601,7 +2603,7 @@ class SpectralStateGuidedSynthesis:
             if len(sequence) < n_frames:
                 sequence.extend([sequence[-1]] * (n_frames - len(sequence)))
         else:
-            rng = np.random.default_rng()
+            rng = rng or np.random.default_rng(seed)
             init_probs = self.initial_probabilities / self.initial_probabilities.sum()
             current_state = int(rng.choice(self.n_states, p=init_probs))
             sequence = [current_state]
@@ -2633,7 +2635,13 @@ class SpectralStateGuidedSynthesis:
         preview = self._apply_gain_floor(preview, minimum_peak=0.75, target_peak=0.9)
         return preview.astype(np.float32), sample_rate
     
-    def sample_state_sequence(self, target_frames: int, temperature: float = 1.0, rng=None):
+    def sample_state_sequence(
+        self,
+        target_frames: int,
+        temperature: float = 1.0,
+        rng=None,
+        seed: Optional[int] = None,
+    ):
         """
         Sample a dynamic state trajectory from the learned Markov transition matrix.
         
@@ -2641,16 +2649,17 @@ class SpectralStateGuidedSynthesis:
             target_frames: Number of frames to generate
             temperature: Softmax sampling temperature (> 0.0). Higher values increase diversity.
             rng: Optional NumPy random generator
+            seed: Optional random seed if rng is None
             
         Returns:
             List of state indices of length target_frames
         """
         if self.transition_matrix is None or self.initial_probabilities is None:
-            raise ValueError("HMM parameters are not initialized")
-        rng = rng or np.random.default_rng()
+            raise ValueError(_ERR_HMM_NOT_INITIALIZED)
+        rng = rng or np.random.default_rng(seed)
         
         init_p = np.clip(self.initial_probabilities, 1e-12, None).astype(np.float64)
-        if temperature > 0.0 and temperature != 1.0:
+        if temperature > 0.0 and abs(temperature - 1.0) > 1e-6:
             init_p = np.exp(np.log(init_p) / float(temperature))
         init_p = init_p / init_p.sum()
         
@@ -2659,7 +2668,7 @@ class SpectralStateGuidedSynthesis:
         
         for _ in range(1, target_frames):
             trans_p = np.clip(self.transition_matrix[current_state], 1e-12, None).astype(np.float64)
-            if temperature > 0.0 and temperature != 1.0:
+            if temperature > 0.0 and abs(temperature - 1.0) > 1e-6:
                 trans_p = np.exp(np.log(trans_p) / float(temperature))
             trans_p = trans_p / trans_p.sum()
             current_state = int(rng.choice(self.n_states, p=trans_p))
@@ -3471,6 +3480,8 @@ class SpectralStateGuidedSynthesis:
         memory_blend: float = 0.7,
         memory_limit: Optional[int] = None,
         n_adaptation_iterations: int = 1,
+        rng=None,
+        seed: Optional[int] = None,
     ) -> Dict[str, float]:
         """
         Adapt the model to new audio using exponential-moving-average (EMA)
@@ -3484,6 +3495,8 @@ class SpectralStateGuidedSynthesis:
             memory_blend: Fraction of memory reserved for existing training frames.
             memory_limit: Optional override of adaptive_memory_limit.
             n_adaptation_iterations: Additional EM iterations on the new data.
+            rng: Optional NumPy random generator.
+            seed: Optional random seed if rng is None.
 
         Returns:
             Dictionary of adaptation metrics.
@@ -3503,7 +3516,7 @@ class SpectralStateGuidedSynthesis:
             frame_metadata,
         ) = self._extract_features_for_adaptation(audio_signal, sample_rate)
 
-        rng = np.random.default_rng()
+        rng = rng or np.random.default_rng(seed)
         self._merge_training_memory(
             frames,
             lpc_coeffs,
