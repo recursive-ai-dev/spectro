@@ -125,7 +125,11 @@ def train_model(
     if resume_from and resume_from.exists():
         logger.info(f"Resuming from checkpoint: {resume_from}")
         ssgs = SpectralStateGuidedSynthesis.load_checkpoint(resume_from)
-        logger.info("Model loaded successfully")
+        if ssgs.lpc_coefficients is None or len(ssgs.lpc_coefficients) == 0:
+            logger.info("Checkpoint does not contain cached training features. Re-extracting from audio files...")
+            audio_file_strs = [str(f) for f in audio_files]
+            ssgs.extract_features_from_files(audio_file_strs, sample_rate)
+        logger.info("Model loaded and ready for EM refinement.")
     else:
         logger.info("Initializing new model")
         ssgs = SpectralStateGuidedSynthesis(

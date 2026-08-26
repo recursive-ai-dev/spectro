@@ -70,12 +70,20 @@ def run_adaptation_persistence_test():
     assert ssgs.training_frames.shape[0] != memory_before
 
     export_path = "adaptive_model_test.npz"
-    ssgs.export_model(export_path, include_training_artifacts=False, include_adaptive_statistics=True)
-    reloaded = SpectralStateGuidedSynthesis.load_model(export_path)
-    if reloaded._adaptive_stats is None:
-        raise AssertionError("Adaptive statistics not restored from export")
-    if reloaded._adaptive_stats.state_frame_counts.shape[0] != ssgs.n_states:
-        raise AssertionError("Adaptive statistics shape mismatch after reload")
+    try:
+        ssgs.export_model(export_path, include_training_artifacts=False, include_adaptive_statistics=True)
+        reloaded = SpectralStateGuidedSynthesis.load_model(export_path)
+        if reloaded._adaptive_stats is None:
+            raise AssertionError("Adaptive statistics not restored from export")
+        if reloaded._adaptive_stats.state_frame_counts.shape[0] != ssgs.n_states:
+            raise AssertionError("Adaptive statistics shape mismatch after reload")
+    finally:
+        import os
+        if os.path.exists(export_path):
+            try:
+                os.remove(export_path)
+            except OSError:
+                pass
 
     # Exercise adaptation rate boundaries (-1 to 12)
     for rate in range(-1, 13):
@@ -103,6 +111,10 @@ def run_adaptation_persistence_test():
             except ValueError:
                 continue
             raise AssertionError(f"Expected ValueError for adaptation_rate={rate}")
+
+
+def test_adaptive_persistence():
+    run_adaptation_persistence_test()
 
 
 if __name__ == "__main__":

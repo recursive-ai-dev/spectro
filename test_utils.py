@@ -92,11 +92,13 @@ def create_test_signal(
     
     # Apply overall envelope (attack, sustain, decay)
     envelope = np.ones_like(t)
-    attack_idx = int(attack_time * sample_rate)
-    decay_start_idx = int((duration - decay_time) * sample_rate)
+    attack_idx = min(len(t), max(0, int(attack_time * sample_rate)))
+    decay_start_idx = max(0, min(len(t), int((duration - decay_time) * sample_rate)))
     
-    envelope[:attack_idx] = np.linspace(0, 1, attack_idx)
-    envelope[decay_start_idx:] = np.linspace(1, 0, len(envelope) - decay_start_idx)
+    if attack_idx > 0:
+        envelope[:attack_idx] = np.linspace(0, 1, attack_idx)
+    if decay_start_idx < len(envelope):
+        envelope[decay_start_idx:] = np.linspace(1, 0, len(envelope) - decay_start_idx)
     
     signal *= envelope
     
@@ -220,10 +222,12 @@ def create_fidelity_demo_signal(sample_rate=16000, duration=3.0, rng=None, seed=
     attack = 0.1
     decay = 0.2
     envelope = np.ones_like(t)
-    attack_samples = int(attack * sample_rate)
-    decay_samples = int(decay * sample_rate)
-    envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
-    envelope[-decay_samples:] = np.linspace(1, 0, decay_samples)
+    attack_samples = min(len(t), max(0, int(attack * sample_rate)))
+    decay_samples = min(len(t), max(0, int(decay * sample_rate)))
+    if attack_samples > 0:
+        envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
+    if decay_samples > 0:
+        envelope[-decay_samples:] = np.linspace(1, 0, decay_samples)
     signal *= envelope
     
     # Add slight noise
@@ -233,3 +237,14 @@ def create_fidelity_demo_signal(sample_rate=16000, duration=3.0, rng=None, seed=
     signal = signal / (np.max(np.abs(signal)) + 1e-10) * 0.8
     
     return signal
+
+
+def test_test_signal_generators():
+    """Verify that all test signal generators produce valid, non-empty, finite signals."""
+    sr = 16000
+    for gen_fn in [create_test_signal, create_rich_test_signal, create_simple_test_signal, create_fidelity_demo_signal]:
+        sig = gen_fn(sample_rate=sr, duration=0.2, seed=42)
+        assert len(sig) == int(sr * 0.2)
+        assert not np.isnan(sig).any()
+        assert not np.isinf(sig).any()
+        assert np.max(np.abs(sig)) > 0.0

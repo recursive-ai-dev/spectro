@@ -682,11 +682,14 @@ class SpectralStateGuidedSynthesis:
 
     def _compute_lpc(self, frame):
         """
-        Compute LPC coefficients using the autocorrelation / Toeplitz approach.
+        Compute LPC coefficients using autocorrelation and Levinson-Durbin recursion.
         """
         autocorr = self._autocorrelation(frame)
         if _NATIVE_BACKEND_AVAILABLE:
             coeffs = ssgs_native.lpc_levinson(autocorr, self.lpc_order)
+            return coeffs.astype(np.float32, copy=False)
+        if _CORE_BACKEND_AVAILABLE:
+            coeffs = ssgs_core.lpc_coefficients(autocorr, self.lpc_order)
             return coeffs.astype(np.float32, copy=False)
         if autocorr[0] <= 1e-8:
             coeffs = np.zeros(self.lpc_order + 1, dtype=np.float32)
@@ -966,6 +969,10 @@ class SpectralStateGuidedSynthesis:
             or self.lpc_coefficients is None
             or self.lpc_coefficients.size == 0
         ):
+            return
+        # If we already have ample training frames (>= 2000), skip augmentation to conserve memory and speed
+        if self.training_frames.shape[0] >= 2000:
+            self.augmentation_applied = True
             return
         if self.sample_rate is None or self.sample_rate <= 0:
             return
@@ -1770,8 +1777,8 @@ class SpectralStateGuidedSynthesis:
 
             mean = np.dot(weights, observations) / weight_sum
             diff = observations - mean
-            cov = (weights[:, None, None] * diff[:, :, None] * diff[:, None, :]).sum(axis=0)
-            cov /= weight_sum
+            weighted_diff = diff * weights[:, None]
+            cov = np.dot(weighted_diff.T, diff) / weight_sum
             cov += np.eye(self.lpc_order) * 1e-5
             self.state_means[state] = mean
             self.state_covariances[state] = cov
@@ -2391,9 +2398,50 @@ class SpectralStateGuidedSynthesis:
         
         return excitation
     
+    @staticmethod
+    def _stabilize_lpc(lpc_coeffs, max_k=0.995):
+        """
+        Ensure all poles of the all-pole filter 1 / A(z) lie strictly within the unit circle.
+        Uses Levinson recursion to convert direct-form coefficients to reflection coefficients
+        (PARCOR parameters), clamps |k_i| <= max_k < 1.0, and reconstructs the minimum-phase polynomial.
+        """
+        p = len(lpc_coeffs)
+        if p == 0:
+            return lpc_coeffs
+        a = np.concatenate([[1.0], lpc_coeffs]).astype(np.float64)
+        a_curr = a.copy()
+        k = np.zeros(p, dtype=np.float64)
+        for i in range(p, 0, -1):
+            ki = a_curr[i]
+            k[i - 1] = ki
+            denom = 1.0 - ki * ki
+            if abs(denom) < 1e-12:
+                denom = 1e-12 if denom >= 0 else -1e-12
+            a_prev = np.zeros(i, dtype=np.float64)
+            a_prev[0] = 1.0
+            for j in range(1, i):
+                a_prev[j] = (a_curr[j] - ki * a_curr[i - j]) / denom
+            a_curr = a_prev
+        
+        # Clamp reflection coefficients for strict minimum-phase stability
+        k_clamped = np.clip(k, -max_k, max_k)
+        
+        # Step-up recursion to reconstruct stable polynomial
+        a_stable = np.array([1.0], dtype=np.float64)
+        for i in range(p):
+            ki = k_clamped[i]
+            a_new = np.zeros(i + 2, dtype=np.float64)
+            a_new[0] = 1.0
+            for j in range(1, i + 1):
+                a_new[j] = a_stable[j] + ki * a_stable[i + 1 - j]
+            a_new[i + 1] = ki
+            a_stable = a_new
+            
+        return a_stable[1:].astype(lpc_coeffs.dtype)
+
     def _lpc_synthesis_filter(self, excitation, lpc_coeffs, zi=None):
         """
-        Phase 2, Step 7: Audio Synthesis using LPC filtering
+        Phase 2, Step 7: Audio Synthesis using stabilized LPC filtering
 
         Args:
             excitation: Excitation signal
@@ -2403,19 +2451,21 @@ class SpectralStateGuidedSynthesis:
         Returns:
             Tuple of (synthesized_audio, new_zi) if zi was provided, else synthesized_audio
         """
-        filter_coeffs = np.concatenate([[1.0], lpc_coeffs])
+        stable_coeffs = self._stabilize_lpc(lpc_coeffs)
+        filter_coeffs = np.concatenate([[1.0], stable_coeffs])
         try:
             if zi is not None:
                 synthesized, new_zi = signal.lfilter([1.0], filter_coeffs, excitation, zi=zi)
             else:
                 synthesized = signal.lfilter([1.0], filter_coeffs, excitation)
                 new_zi = None
-            synthesized = synthesized.astype(np.float32)
+            synthesized = np.nan_to_num(synthesized, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
         except (ValueError, LinAlgError, RuntimeError) as e:
             logger.warning(f"LPC filter failed ({type(e).__name__}: {e}), falling back to convolution")
             # Fallback is mathematically incorrect but at least won't crash
             # Note: This fallback does NOT support state carry
             synthesized = np.convolve(excitation, filter_coeffs[::-1], mode="same").astype(np.float32)
+            synthesized = np.nan_to_num(synthesized, nan=0.0, posinf=1.0, neginf=-1.0)
             new_zi = zi
 
         max_val = np.max(np.abs(synthesized))
@@ -2583,12 +2633,49 @@ class SpectralStateGuidedSynthesis:
         preview = self._apply_gain_floor(preview, minimum_peak=0.75, target_peak=0.9)
         return preview.astype(np.float32), sample_rate
     
+    def sample_state_sequence(self, target_frames: int, temperature: float = 1.0, rng=None):
+        """
+        Sample a dynamic state trajectory from the learned Markov transition matrix.
+        
+        Args:
+            target_frames: Number of frames to generate
+            temperature: Softmax sampling temperature (> 0.0). Higher values increase diversity.
+            rng: Optional NumPy random generator
+            
+        Returns:
+            List of state indices of length target_frames
+        """
+        if self.transition_matrix is None or self.initial_probabilities is None:
+            raise ValueError("HMM parameters are not initialized")
+        rng = rng or np.random.default_rng()
+        
+        init_p = np.clip(self.initial_probabilities, 1e-12, None).astype(np.float64)
+        if temperature > 0.0 and temperature != 1.0:
+            init_p = np.exp(np.log(init_p) / float(temperature))
+        init_p = init_p / init_p.sum()
+        
+        current_state = int(rng.choice(self.n_states, p=init_p))
+        path = [current_state]
+        
+        for _ in range(1, target_frames):
+            trans_p = np.clip(self.transition_matrix[current_state], 1e-12, None).astype(np.float64)
+            if temperature > 0.0 and temperature != 1.0:
+                trans_p = np.exp(np.log(trans_p) / float(temperature))
+            trans_p = trans_p / trans_p.sum()
+            current_state = int(rng.choice(self.n_states, p=trans_p))
+            path.append(current_state)
+            
+        return path
+
     def synthesize_audio(
         self,
         target_duration_seconds,
         sample_rate=16000,
         fidelity=0.0,
         excitation_type='Karplus-Strong',
+        state_sequence=None,
+        method='viterbi',
+        temperature=1.0,
         rng=None,
         seed=None,
     ):
@@ -2604,6 +2691,9 @@ class SpectralStateGuidedSynthesis:
                      Values in between blend both approaches
             excitation_type: Type of excitation for synthesis ('Karplus-Strong' or 'Wavelet')
                            Only used when fidelity < 1.0
+            state_sequence: Optional precomputed state sequence
+            method: Sequence decoding method ('viterbi' or 'stochastic'/'markov')
+            temperature: Temperature for stochastic sequence sampling
 
         Args:
             rng: Optional NumPy random generator for deterministic excitation.
@@ -2627,12 +2717,21 @@ class SpectralStateGuidedSynthesis:
         if fidelity < 1.0:
             print(f"Excitation type: {excitation_type}")
 
-        # Step 5: Decode optimal state sequence using smoothness-aware DP
-        print("Step 5: Decoding state sequence with smoothness-aware dynamic programming...")
-        state_sequence = self._a_star_search(target_frames)
+        rng = rng or np.random.default_rng(seed)
+
+        # Step 5: Decode or sample state sequence
+        if state_sequence is not None:
+            if len(state_sequence) < target_frames:
+                raise ValueError(f"Provided state_sequence length ({len(state_sequence)}) < target_frames ({target_frames})")
+            state_sequence = list(state_sequence[:target_frames])
+        elif method in ('stochastic', 'markov', 'sample'):
+            print("Step 5: Sampling state sequence from Markov transition matrix...")
+            state_sequence = self.sample_state_sequence(target_frames, temperature=temperature, rng=rng)
+        else:
+            print("Step 5: Decoding state sequence with smoothness-aware dynamic programming...")
+            state_sequence = self._a_star_search(target_frames)
 
         audio_output = np.zeros(target_frames * self.hop_size, dtype=np.float32)
-        rng = rng or np.random.default_rng(seed)
 
         print("Step 6-8: Generating excitation, synthesizing audio...")
         
@@ -3221,9 +3320,17 @@ class SpectralStateGuidedSynthesis:
                         audio_signal = audio_signal.mean(axis=1)
                     # Resample if needed
                     if file_sr != sample_rate:
-                        from scipy.signal import resample
-                        num_samples = int(len(audio_signal) * sample_rate / file_sr)
-                        audio_signal = resample(audio_signal, num_samples)
+                        from math import gcd
+                        g = gcd(int(sample_rate), int(file_sr))
+                        up = int(sample_rate) // g
+                        down = int(file_sr) // g
+                        try:
+                            from scipy.signal import resample_poly
+                            audio_signal = resample_poly(audio_signal, up, down)
+                        except Exception:
+                            from scipy.signal import resample
+                            num_samples = int(len(audio_signal) * sample_rate / file_sr)
+                            audio_signal = resample(audio_signal, num_samples)
                     audio_signal = audio_signal.astype(np.float32)
                 except Exception as e:
                     raise ValueError(f"Failed to load audio file {audio_input}: {e}")
@@ -3467,6 +3574,9 @@ class SpectralStateGuidedSynthesis:
         sample_rate=16000,
         fidelity=0.0,
         excitation_type='Karplus-Strong',
+        state_sequence=None,
+        method='viterbi',
+        temperature=1.0,
         rng=None,
         seed=None,
     ):
@@ -3481,6 +3591,9 @@ class SpectralStateGuidedSynthesis:
                      1.0 = high fidelity reconstruction of training audio
                      0.5 = balanced mix showing variance
             excitation_type: Type of excitation ('Karplus-Strong' or 'Wavelet')
+            state_sequence: Optional precomputed state sequence
+            method: Sequence decoding method ('viterbi' or 'stochastic'/'markov')
+            temperature: Temperature for stochastic sequence sampling
 
         Args:
             rng: Optional NumPy random generator for deterministic excitation.
@@ -3497,6 +3610,9 @@ class SpectralStateGuidedSynthesis:
             sample_rate,
             fidelity=fidelity,
             excitation_type=excitation_type,
+            state_sequence=state_sequence,
+            method=method,
+            temperature=temperature,
             rng=rng,
             seed=seed,
         )

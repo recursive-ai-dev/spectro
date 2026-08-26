@@ -76,6 +76,18 @@ def _assert_native_load():
     print("[regression] native library loaded.")
 
 
+def test_native_load():
+    _assert_native_load()
+
+
+def test_core_equivalence():
+    _assert_equivalence()
+
+
+def test_native_integration():
+    _assert_native_integration()
+
+
 if __name__ == "__main__":
     _assert_native_load()
     _assert_equivalence()
