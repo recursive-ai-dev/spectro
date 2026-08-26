@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectro"
+version = "1.1.0"
+description = "Spectral-State Guided Synthesis (SSGS) - Hybrid Generative Audio Model"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Damien Davison"},
+    {name = "Michael Maillet"},
+    {name = "Sacha Davison"}
+]
+keywords = ["audio", "dsp", "lpc", "hmm", "synthesis", "generative"]
+dependencies = [
+    "numpy>=1.21.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.4.0",
+    "soundfile>=0.10.0",
+    "PyWavelets>=1.1.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[tool.setuptools]
+py-modules = ["ssgs", "ssgs_core", "ssgs_native"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

@@ -6,7 +6,7 @@
  *   ssgs_forward_backward, ssgs_decode
  *
  * Flat row-major float64 arrays, no allocation inside hot loops.
- * Build: gcc -shared -fPIC -O3 -o ssgs_native.so ssgs_native.c -lm
+ * Build: gcc -shared -fPIC -O3 -o libssgs_native.so ssgs_native.c -lm
  */
 #include <math.h>
 #include <stdlib.h>
@@ -18,6 +18,7 @@
 #endif
 
 static double logsumexp(const double *x, int n) {
+    if (n <= 0) return -1e300;
     double m = x[0];
     for (int i = 1; i < n; i++) if (x[i] > m) m = x[i];
     double s = 0.0;
@@ -29,21 +30,24 @@ static double logsumexp(const double *x, int n) {
 void ssgs_lpc_levinson(const double *r, int p, double *a) {
     for (int i = 0; i <= p; i++) a[i] = 0.0;
     a[0] = 1.0;
-    if (r[0] <= 1e-8) return;
+    if (r[0] <= 1e-8 || p <= 0) return;
+
+    double *upd = (double *)malloc((p + 1) * sizeof(double));
+    if (!upd) return;
+
     double err = r[0];
     for (int i = 1; i <= p; i++) {
         double acc = r[i];
         for (int j = 1; j < i; j++) acc += a[j] * r[i - j];
         double k = -acc / err;
-        double *upd = (double *)malloc((p + 1) * sizeof(double));
         upd[0] = 1.0;
         for (int j = 1; j < i; j++) upd[j] = a[j] + k * a[i - j];
         upd[i] = k;
         for (int j = 0; j <= i; j++) a[j] = upd[j];
-        free(upd);
         err *= (1.0 - k * k);
         if (err <= 1e-12) break;
     }
+    free(upd);
 }
 
 /* ---- Gaussian emission: hand Cholesky + forward solve ---- */
@@ -67,19 +71,23 @@ static int chol_lower(const double *A, int p, double *L) {
 void ssgs_gaussian_logprobs(const double *means, const double *covs,
                             const double *obs, int S, int p, int T,
                             double *out) {
+    if (S <= 0 || p <= 0 || T <= 0) return;
     double c = p * log(2.0 * M_PI);
     double *L = (double *)malloc(p * p * sizeof(double));
     double *d = (double *)malloc(p * sizeof(double));
     double *y = (double *)malloc(p * sizeof(double));
+    double *cj = (double *)malloc(p * p * sizeof(double));
+    if (!L || !d || !y || !cj) {
+        free(L); free(d); free(y); free(cj);
+        return;
+    }
     for (int s = 0; s < S; s++) {
         const double *cov = covs + s * p * p;
         int ok = chol_lower(cov, p, L);
         if (!ok) {
-            double *cj = (double *)malloc(p * p * sizeof(double));
             memcpy(cj, cov, p * p * sizeof(double));
             for (int i = 0; i < p; i++) cj[i * p + i] += 1e-4;
             chol_lower(cj, p, L);
-            free(cj);
         }
         double logdet = 0.0;
         for (int i = 0; i < p; i++) logdet += log(L[i * p + i]);
@@ -98,16 +106,22 @@ void ssgs_gaussian_logprobs(const double *means, const double *covs,
             out[t * S + s] = -0.5 * (quad + c + logdet);
         }
     }
-    free(L); free(d); free(y);
+    free(L); free(d); free(y); free(cj);
 }
 
 /* ---- Forward-backward (EM expectation step) ---- */
 void ssgs_forward_backward(const double *emit, const double *init,
                            const double *trans, int T, int S,
                            double *gamma, double *xi, double *loglik) {
+    if (T <= 0 || S <= 0) return;
     double *alpha = (double *)malloc(T * S * sizeof(double));
     double *beta = (double *)malloc(T * S * sizeof(double));
     double *tmp = (double *)malloc(S * sizeof(double));
+    double *row = (double *)malloc(S * sizeof(double));
+    if (!alpha || !beta || !tmp || !row) {
+        free(alpha); free(beta); free(tmp); free(row);
+        return;
+    }
     for (int s = 0; s < S; s++) alpha[s] = init[s] + emit[s];
     for (int t = 1; t < T; t++) {
         for (int j = 0; j < S; j++) {
@@ -124,13 +138,10 @@ void ssgs_forward_backward(const double *emit, const double *init,
         }
     }
     for (int t = 0; t < T; t++) {
-        // Normalizer is over s of (alpha[t,s] + beta[t,s]); gamma_t(s) ∝ alpha*beta.
-        double *row = (double *)malloc(S * sizeof(double));
         for (int s = 0; s < S; s++) row[s] = alpha[t * S + s] + beta[t * S + s];
         double ls = logsumexp(row, S);
         for (int s = 0; s < S; s++)
             gamma[t * S + s] = exp(alpha[t * S + s] + beta[t * S + s] - ls);
-        free(row);
     }
     for (int t = 0; t < T - 1; t++) {
         double *xr = xi + t * S * S;
@@ -142,16 +153,18 @@ void ssgs_forward_backward(const double *emit, const double *init,
         for (int k = 0; k < S * S; k++) xr[k] = exp(xr[k] - ls2);
     }
     *loglik = logsumexp(alpha + (T - 1) * S, S);
-    free(alpha); free(beta); free(tmp);
+    free(alpha); free(beta); free(tmp); free(row);
 }
 
 /* ---- Smoothness-first lexicographic Viterbi decode ---- */
 void ssgs_decode(const double *trans, const double *smooth,
                  const double *init, double weight, int S, int nframes,
                  int *path) {
+    if (S <= 0 || nframes <= 0) return;
     if (weight <= 0.0) {
         double *dp = (double *)malloc(nframes * S * sizeof(double));
         int *back = (int *)malloc(nframes * S * sizeof(int));
+        if (!dp || !back) { free(dp); free(back); return; }
         for (int s = 0; s < S; s++) dp[s] = init[s];
         for (int t = 1; t < nframes; t++) {
             for (int j = 0; j < S; j++) {
@@ -174,6 +187,7 @@ void ssgs_decode(const double *trans, const double *smooth,
     double *dps = (double *)malloc(nframes * S * sizeof(double));
     double *dpt = (double *)malloc(nframes * S * sizeof(double));
     int *back = (int *)malloc(nframes * S * sizeof(int));
+    if (!dps || !dpt || !back) { free(dps); free(dpt); free(back); return; }
     for (int s = 0; s < S; s++) { dps[s] = 0.0; dpt[s] = init[s]; }
     double tol = 1e-9;
     for (int t = 1; t < nframes; t++) {
