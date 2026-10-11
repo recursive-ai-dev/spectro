@@ -4,11 +4,13 @@ This document describes how to train SSGS models on audio files with persistent 
 
 ## Overview
 
-SSGS now supports:
-- **Training on multiple audio files** from directories
-- **Persistent checkpointing** during training using safetensors format
+SSGS supports:
+- **Training on multiple audio files** from directories, with case-insensitive extension matching and stable, duplicate-free discovery
+- **Independent sequence boundaries** between recordings, preventing transitions from being learned across unrelated files
+- **Persistent checkpointing** during training using the safetensors format
 - **Checkpoint upload/download** (save/load from local directories or cloud storage)
-- **Verified safetensor format** ensuring security and reproducibility
+- **Validated, atomic persistence** for model parameters and optional training/adaptation artifacts
+- **Reproducible initialization** through a user-specified random seed
 
 ## Quick Start
 
@@ -21,10 +23,16 @@ python train_on_folder.py --folders training_001 training_002
 ```
 
 This will:
-- Extract features from all audio files
+- Find supported files case-insensitively (duplicate folders do not duplicate input files)
+- Extract features from all audio files and keep each recording as an independent sequence
 - Train the SSGS model with EM iterations
 - Save checkpoints periodically during training
 - Export the final model in both `.safetensors` and `.npz` formats
+
+Path-based audio is decoded and resampled to `--sample-rate`; array inputs passed to
+the Python API are assumed to already use the supplied rate. Mono and
+samples-by-channels arrays are accepted. Integer PCM is normalized before analysis,
+and malformed/non-finite samples fail with a clear `ValueError`.
 
 ### 2. Use Checkpoints in Python
 
@@ -57,22 +65,26 @@ Options:
   --folders FOLDER [FOLDER ...]
                         Folders containing training audio files
                         (default: training_001 training_002)
-  
+
   --sample-rate RATE    Target sample rate (default: 16000)
-  
+
   --n-states N          Number of HMM states (default: 34)
                         More states = more expressive generation
-  
+
   --n-iterations N      Number of EM iterations (default: 20)
-  
+
   --checkpoint-dir DIR  Directory to save checkpoints (default: models/)
-  
+
   --checkpoint-interval N
                         Save checkpoint every N iterations (default: 5)
                         Set to 0 to disable periodic checkpoints
-  
+
   --resume PATH         Resume training from checkpoint
-  
+
+  --seed N              Random seed for reproducible initialization (default: 0)
+
+  --recursive           Search folders and their subdirectories
+
   --extensions EXT [EXT ...]
                         Audio file extensions to process
                         (default: .mp3 .wav .flac .ogg)
@@ -92,6 +104,9 @@ python train_on_folder.py --resume models/checkpoint_epoch_10.safetensors
 
 # Train with more states for higher quality
 python train_on_folder.py --n-states 42
+
+# Recursively discover audio and pin initialization for repeatability
+python train_on_folder.py --folders corpus --recursive --seed 42
 ```
 
 ## Checkpoint Format

@@ -52,40 +52,30 @@ def find_audio_files(
     extensions: Optional[List[str]] = None,
     recursive: bool = False,
 ) -> List[Path]:
-    """
-    Find all audio files in specified folders.
-    
-    Args:
-        folders: List of folder paths to search
-        extensions: List of file extensions to include (default: ['.mp3', '.wav', '.flac', '.ogg'])
-        recursive: Whether to search recursively through subdirectories
-        
-    Returns:
-        List of Path objects for found audio files
-    """
+    """Find supported audio files case-insensitively and return a stable unique list."""
     if extensions is None:
-        extensions = ['.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac']
-    
-    audio_files = []
+        extensions = [".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"]
+    normalized_extensions = {
+        (extension if str(extension).startswith(".") else f".{extension}").casefold()
+        for extension in extensions
+    }
+    if not normalized_extensions:
+        raise ValueError("extensions must contain at least one file suffix")
+
+    discovered = set()
     for folder_name in folders:
         folder = Path(folder_name)
         if not folder.exists():
-            logger.warning(f"Folder not found: {folder}")
+            logger.warning("Folder not found: %s", folder)
             continue
-        
         if not folder.is_dir():
-            logger.warning(f"Not a directory: {folder}")
+            logger.warning("Not a directory: %s", folder)
             continue
-        
-        # Find all audio files in the folder
-        for ext in extensions:
-            pattern = f"*{ext}"
-            found = list(folder.rglob(pattern) if recursive else folder.glob(pattern))
-            audio_files.extend(found)
-            logger.info(f"Found {len(found)} {ext} files in {folder}")
-    
-    audio_files.sort()  # Sort for reproducibility
-    return audio_files
+        candidates = folder.rglob("*") if recursive else folder.glob("*")
+        matches = [path for path in candidates if path.is_file() and path.suffix.casefold() in normalized_extensions]
+        discovered.update(matches)
+        logger.info("Found %d supported audio files in %s", len(matches), folder)
+    return sorted(discovered, key=lambda path: (str(path).casefold(), str(path)))
 
 
 def train_model(
@@ -96,6 +86,7 @@ def train_model(
     checkpoint_dir: Optional[Path] = None,
     checkpoint_interval: int = 5,
     resume_from: Optional[Path] = None,
+    random_state: Optional[int] = 0,
 ) -> SpectralStateGuidedSynthesis:
     """
     Train SSGS model on audio files with checkpointing.
@@ -117,6 +108,16 @@ def train_model(
             "No audio files provided for training. "
             "Check folder paths, extensions, or enable recursive search."
         )
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
+        raise ValueError("sample_rate must be a positive integer")
+    if isinstance(n_states, bool) or not isinstance(n_states, int) or n_states <= 0:
+        raise ValueError("n_states must be a positive integer")
+    if isinstance(n_em_iterations, bool) or not isinstance(n_em_iterations, int) or n_em_iterations < 0:
+        raise ValueError("n_em_iterations must be a non-negative integer")
+    if isinstance(checkpoint_interval, bool) or not isinstance(checkpoint_interval, int) or checkpoint_interval < 0:
+        raise ValueError("checkpoint_interval must be a non-negative integer")
+    if resume_from is not None and not Path(resume_from).exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
     if checkpoint_dir is None:
         checkpoint_dir = Path("models")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -138,6 +139,7 @@ def train_model(
             frame_size=1024,
             hop_size=256,
             smoothness_weight=0.5,
+            random_state=random_state,
         )
         
         # Feature extraction
@@ -259,6 +261,12 @@ def main():
         help="Audio file extensions to process (default: .mp3 .wav .flac .ogg)"
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for reproducible model initialization (default: 0)",
+    )
+    parser.add_argument(
         "--recursive",
         action="store_true",
         help="Search for audio files recursively within folders",
@@ -297,6 +305,7 @@ def main():
             checkpoint_dir=args.checkpoint_dir,
             checkpoint_interval=args.checkpoint_interval,
             resume_from=args.resume,
+            random_state=args.seed,
         )
         
         # Generate a test sample

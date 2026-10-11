@@ -215,6 +215,46 @@ Train on folders of audio with checkpointing:
 python train_on_folder.py --folders training_001 training_002
 ```
 
+## Robustness, Input Handling & Reproducibility
+
+SSGS validates its configuration, features, and model parameters before numerical
+work begins. Audio inputs must be finite mono samples or samples-by-channels arrays;
+integer PCM is centered/scaled to floating point, stereo is downmixed, and file
+inputs are resampled to the requested analysis rate. Framing pads the final partial
+hop so the tail of a recording is not silently dropped. When training on multiple
+recordings, each recording (and each augmentation) is marked as a separate HMM
+sequence, so EM does not learn a fabricated transition across file boundaries.
+
+Use a seed for repeatable initialization and seeded stochastic generation:
+
+```python
+from ssgs import SpectralStateGuidedSynthesis
+
+model = SpectralStateGuidedSynthesis(n_states=16, random_state=42)
+model.train(["speech_a.wav", "speech_b.wav"], sample_rate=16000, n_em_iterations=10)
+audio = model.generate(
+    duration_seconds=3.0,
+    sample_rate=22050,
+    method="stochastic",
+    seed=123,
+)
+```
+
+The model uses regularized positive-definite state covariances, smoothed transition
+probabilities, continuous LPC filter state during synthesis, and output resampling
+with exact requested sample counts. NPZ exports and safetensors checkpoints are
+written atomically; loading validates tensor shapes, values, and aligned optional
+training artifacts. Set `include_training_artifacts=True` when exporting if you
+need cached frames, residuals, and original sequence boundaries for analysis or
+retraining. The optional native backend remains interchangeable with the NumPy
+reference path.
+
+Run the complete regression suite with:
+
+```bash
+python -m pytest -q
+```
+
 ## Adaptive Learning
 
 SSGS can adapt to new audio using persistent statistics:

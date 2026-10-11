@@ -77,6 +77,34 @@ pytest -q test_ar_process.py
 
 ## Expected Outcomes
 - The recovered LPC mean is within ±0.05 of the ground-truth coefficients.
+
+---
+
+# Robustness Regression Coverage
+
+## Purpose
+Exercise public and internal contracts for validation, numerical stability,
+sequence segmentation, reproducibility, synthesis, and serialization.
+
+## Tests
+**Script:** `test_robustness.py`
+
+Coverage includes:
+- Invalid model settings, sample rates, audio arrays, frequency bounds, sequence starts, state paths, and BIC candidates fail explicitly.
+- Integer PCM, unsigned PCM, multichannel input, sample-rate conversion, and padded tail frames behave consistently.
+- Forward/backward inference handles one-frame and segmented observations without adding transitions between recordings.
+- Singular Gaussian covariances and unstable LPC filters are repaired without non-finite results.
+- Cache invalidation, seeded k-means/stochastic generation, exact output length, and preview-buffer isolation are checked.
+- Multi-recording boundaries survive training-artifact export/load; folder discovery is case-insensitive, deterministic, and duplicate-free.
+
+## How to Run
+```bash
+python -m pytest -q test_robustness.py
+python -m pytest -q
+```
+
+The full suite should complete without failures; the robustness module currently
+contains focused regression cases for the newly hardened paths.
 # Production Hardening Tests
 
 ## Purpose
