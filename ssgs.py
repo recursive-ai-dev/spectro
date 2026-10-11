@@ -17,6 +17,9 @@
 
 import json
 import logging
+import math
+import os
+import tempfile
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -117,6 +120,7 @@ class _TrainingArtifacts:
     spectral_flux: Optional[np.ndarray] = None
     augmentation_applied: bool = False
     preview_snapshots: List[Dict[str, Any]] = field(default_factory=list)
+    sequence_starts: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -181,6 +185,9 @@ class SpectralStateGuidedSynthesis:
         smoothness_weight=0.5,
         auto_n_states=False,
         adaptive_memory_limit=6000,
+        random_state=None,
+        covariance_floor=1e-4,
+        transition_pseudocount=1e-6,
     ):
         """
         Initialize SSGS parameters
@@ -197,15 +204,46 @@ class SpectralStateGuidedSynthesis:
                           When enabled, the n_states parameter is ignored and the optimal
                           value is determined during initialize_hmm_parameters().
         """
-        if auto_n_states:
+        def positive_int(name, value):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{name} must be a positive integer")
+            if int(value) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            return int(value)
+
+        self.n_states = positive_int("n_states", n_states)
+        self.lpc_order = positive_int("lpc_order", lpc_order)
+        self.frame_size = positive_int("frame_size", frame_size)
+        self.hop_size = positive_int("hop_size", hop_size)
+        self.adaptive_memory_limit = positive_int("adaptive_memory_limit", adaptive_memory_limit)
+        if self.frame_size <= self.lpc_order:
+            raise ValueError("frame_size must be greater than lpc_order")
+        if self.hop_size > self.frame_size:
+            raise ValueError("hop_size must be less than or equal to frame_size")
+        for name, value, allow_zero in (
+            ("smoothness_weight", smoothness_weight, True),
+            ("covariance_floor", covariance_floor, False),
+            ("transition_pseudocount", transition_pseudocount, False),
+        ):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number)):
+                raise ValueError(f"{name} must be a finite real number")
+            if not np.isfinite(value) or value < 0 or (not allow_zero and value == 0):
+                bound = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be finite and {bound}")
+        if random_state is not None and (
+            isinstance(random_state, (bool, np.bool_))
+            or not isinstance(random_state, (int, np.integer))
+        ):
+            raise ValueError("random_state must be an integer or None")
+
+        self.smoothness_weight = float(smoothness_weight)
+        self.auto_n_states = bool(auto_n_states)
+        self.covariance_floor = float(covariance_floor)
+        self.transition_pseudocount = float(transition_pseudocount)
+        self.random_state = int(random_state) if random_state is not None else int(np.random.SeedSequence().entropy)
+        self._rng = np.random.default_rng(self.random_state)
+        if self.auto_n_states:
             logger.info("auto_n_states enabled: n_states parameter will be determined automatically")
-        self.n_states = n_states
-        self.lpc_order = lpc_order
-        self.frame_size = frame_size
-        self.hop_size = hop_size
-        self.smoothness_weight = smoothness_weight
-        self.auto_n_states = auto_n_states
-        self.adaptive_memory_limit = int(adaptive_memory_limit)
         
         # Internal state containers keep responsibilities isolated yet accessible.
         self._params = _ModelParameters()
@@ -227,6 +265,7 @@ class SpectralStateGuidedSynthesis:
     @transition_matrix.setter
     def transition_matrix(self, matrix):
         self._params.transition_matrix = matrix
+        self._invalidate_model_caches()
 
     @property
     def initial_probabilities(self):
@@ -235,6 +274,7 @@ class SpectralStateGuidedSynthesis:
     @initial_probabilities.setter
     def initial_probabilities(self, probabilities):
         self._params.initial_probabilities = probabilities
+        self._invalidate_model_caches()
 
     @property
     def state_means(self):
@@ -243,6 +283,7 @@ class SpectralStateGuidedSynthesis:
     @state_means.setter
     def state_means(self, means):
         self._params.state_means = means
+        self._invalidate_model_caches()
 
     @property
     def state_covariances(self):
@@ -251,6 +292,7 @@ class SpectralStateGuidedSynthesis:
     @state_covariances.setter
     def state_covariances(self, covariances):
         self._params.state_covariances = covariances
+        self._invalidate_model_caches()
 
     @property
     def training_frames(self):
@@ -259,6 +301,7 @@ class SpectralStateGuidedSynthesis:
     @training_frames.setter
     def training_frames(self, frames):
         self._artifacts.training_frames = frames
+        self._invalidate_model_caches()
 
     @property
     def lpc_coefficients(self):
@@ -267,6 +310,7 @@ class SpectralStateGuidedSynthesis:
     @lpc_coefficients.setter
     def lpc_coefficients(self, coeffs):
         self._artifacts.lpc_coefficients = coeffs
+        self._invalidate_model_caches()
 
     @property
     def residual_signals(self):
@@ -275,6 +319,7 @@ class SpectralStateGuidedSynthesis:
     @residual_signals.setter
     def residual_signals(self, residuals):
         self._artifacts.residual_signals = residuals
+        self._invalidate_model_caches()
 
     @property
     def perceptual_features(self):
@@ -283,6 +328,7 @@ class SpectralStateGuidedSynthesis:
     @perceptual_features.setter
     def perceptual_features(self, features):
         self._artifacts.perceptual_features = features
+        self._invalidate_model_caches()
 
     @property
     def spectral_flux(self):
@@ -291,6 +337,7 @@ class SpectralStateGuidedSynthesis:
     @spectral_flux.setter
     def spectral_flux(self, values):
         self._artifacts.spectral_flux = values
+        self._invalidate_model_caches()
 
     @property
     def frame_metadata(self):
@@ -302,6 +349,25 @@ class SpectralStateGuidedSynthesis:
             self._artifacts.frame_metadata = {}
         else:
             self._artifacts.frame_metadata = metadata
+        self._invalidate_model_caches()
+
+    @property
+    def sequence_starts(self):
+        return self._artifacts.sequence_starts
+
+    @sequence_starts.setter
+    def sequence_starts(self, starts):
+        if starts is None:
+            self._artifacts.sequence_starts = None
+        else:
+            values = np.asarray(starts)
+            if values.ndim != 1 or values.size == 0 or values.dtype.kind == "b":
+                raise ValueError("sequence_starts must be a non-empty 1-D integer array")
+            if values.dtype.kind not in "iu":
+                if values.dtype.kind != "f" or not np.all(np.isfinite(values)) or not np.all(values == np.floor(values)):
+                    raise ValueError("sequence_starts must contain integer indices")
+            self._artifacts.sequence_starts = values.astype(np.int64, copy=True)
+        self._invalidate_model_caches()
 
     @property
     def sample_rate(self):
@@ -312,7 +378,7 @@ class SpectralStateGuidedSynthesis:
         if value is None:
             self._artifacts.sample_rate = None
         else:
-            self._artifacts.sample_rate = int(value)
+            self._artifacts.sample_rate = self._coerce_sample_rate(value)
 
     @property
     def augmentation_applied(self):
@@ -329,6 +395,11 @@ class SpectralStateGuidedSynthesis:
     def clear_preview_snapshots(self):
         self._artifacts.preview_snapshots.clear()
 
+    def _invalidate_model_caches(self):
+        """Invalidate derived data whenever a public model/artifact array is replaced."""
+        if hasattr(self, "_caches"):
+            self._reset_caches()
+
     def _reset_caches(self):
         self._caches.reset()
         self._reset_feature_indexes()
@@ -336,6 +407,110 @@ class SpectralStateGuidedSynthesis:
     def _reset_feature_indexes(self):
         """Drop any cached nearest-neighbor structures tied to frame features."""
         self._feature_indexes = {}
+
+    def _normalize_sequence_starts(self, n_frames, sequence_starts=None):
+        """Return validated starts for concatenated independent sequences."""
+        if isinstance(n_frames, (bool, np.bool_)) or int(n_frames) <= 0:
+            raise ValueError("observations must contain at least one frame")
+        n_frames = int(n_frames)
+        if sequence_starts is None:
+            if (
+                self.sequence_starts is not None
+                and self.lpc_coefficients is not None
+                and len(self.lpc_coefficients) == n_frames
+            ):
+                sequence_starts = self.sequence_starts
+            else:
+                sequence_starts = np.array([0], dtype=np.int64)
+        starts = np.asarray(sequence_starts)
+        if starts.ndim != 1 or starts.size == 0 or starts.dtype.kind == "b":
+            raise ValueError("sequence_starts must be a non-empty 1-D integer array")
+        if starts.dtype.kind not in "iu":
+            if starts.dtype.kind != "f" or not np.all(np.isfinite(starts)) or not np.all(starts == np.floor(starts)):
+                raise ValueError("sequence_starts must contain integer frame indices")
+        starts = starts.astype(np.int64, copy=False)
+        if starts[0] != 0 or np.any(starts < 0) or np.any(starts >= n_frames):
+            raise ValueError("sequence_starts must begin at 0 and index existing frames")
+        if np.any(np.diff(starts) <= 0):
+            raise ValueError("sequence_starts must be strictly increasing")
+        return starts
+
+    def _sequence_slices(self, n_frames, sequence_starts=None):
+        starts = self._normalize_sequence_starts(n_frames, sequence_starts)
+        ends = np.concatenate((starts[1:], np.array([int(n_frames)], dtype=np.int64)))
+        return [(int(start), int(end)) for start, end in zip(starts, ends)]
+
+    def _regularize_covariance(self, covariance, *, floor=None):
+        """Symmetrize and make a covariance matrix numerically positive definite."""
+        floor = self.covariance_floor if floor is None else float(floor)
+        cov = np.asarray(covariance, dtype=np.float64)
+        if cov.shape != (self.lpc_order, self.lpc_order):
+            raise ValueError(f"covariance must have shape ({self.lpc_order}, {self.lpc_order})")
+        if not np.all(np.isfinite(cov)):
+            raise ValueError("covariance contains NaN or infinite values")
+        cov = 0.5 * (cov + cov.T)
+        minimum = float(np.min(np.linalg.eigvalsh(cov)))
+        if minimum < floor:
+            cov = cov + np.eye(self.lpc_order) * (floor - minimum)
+        return 0.5 * (cov + cov.T)
+
+    @staticmethod
+    def _normalize_probabilities(probabilities, *, axis=None, fallback=None):
+        """Normalize non-negative finite probabilities, recovering zero-mass rows."""
+        probs = np.asarray(probabilities, dtype=np.float64)
+        if not np.all(np.isfinite(probs)) or np.any(probs < 0):
+            raise ValueError("probabilities must be finite and non-negative")
+        if axis is None:
+            total = float(probs.sum())
+            if total <= 0:
+                if fallback is None:
+                    return np.full(probs.shape, 1.0 / max(probs.size, 1), dtype=np.float64)
+                probs = np.asarray(fallback, dtype=np.float64).copy()
+                total = float(probs.sum())
+                if total <= 0 or not np.isfinite(total):
+                    return np.full(probs.shape, 1.0 / max(probs.size, 1), dtype=np.float64)
+            return probs / total
+        totals = probs.sum(axis=axis, keepdims=True)
+        zero = totals <= 0
+        if np.any(zero):
+            if fallback is None:
+                probs = np.where(zero, 1.0, probs)
+            else:
+                fallback = np.asarray(fallback, dtype=np.float64)
+                probs = np.where(zero, fallback, probs)
+            totals = probs.sum(axis=axis, keepdims=True)
+        return probs / np.maximum(totals, np.finfo(np.float64).tiny)
+
+    def _validated_model_parameters(self):
+        """Return shape-checked, normalized model arrays without mutating public state."""
+        if any(value is None for value in (
+            self.transition_matrix,
+            self.initial_probabilities,
+            self.state_means,
+            self.state_covariances,
+        )):
+            raise ValueError(_ERR_HMM_NOT_INITIALIZED)
+        transition = np.asarray(self.transition_matrix, dtype=np.float64)
+        initial = np.asarray(self.initial_probabilities, dtype=np.float64)
+        means = np.asarray(self.state_means, dtype=np.float64)
+        covariances = np.asarray(self.state_covariances, dtype=np.float64)
+        if transition.shape != (self.n_states, self.n_states):
+            raise ValueError("transition_matrix shape does not match n_states")
+        if initial.shape != (self.n_states,):
+            raise ValueError("initial_probabilities shape does not match n_states")
+        if means.shape != (self.n_states, self.lpc_order):
+            raise ValueError("state_means shape does not match model configuration")
+        if covariances.shape != (self.n_states, self.lpc_order, self.lpc_order):
+            raise ValueError("state_covariances shape does not match model configuration")
+        for name, array in (("transition_matrix", transition), ("initial_probabilities", initial),
+                            ("state_means", means), ("state_covariances", covariances)):
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"{name} contains NaN or infinite values")
+        if np.any(transition < 0) or np.any(initial < 0):
+            raise ValueError("transition and initial probabilities must be non-negative")
+        transition = self._normalize_probabilities(transition, axis=1)
+        initial = self._normalize_probabilities(initial)
+        return transition, initial, means, covariances
 
     def _record_preview_snapshot(
         self,
@@ -357,29 +532,51 @@ class SpectralStateGuidedSynthesis:
         return snapshot
 
     def _compute_and_cache_cholesky_factors(self):
-        """Ensure per-state Cholesky factors and log-determinants are cached."""
+        """Validate covariance dimensions and cache robust lower Cholesky factors."""
         if self.state_covariances is None:
             return
+        if np.shape(self.state_covariances) != (self.n_states, self.lpc_order, self.lpc_order):
+            raise ValueError(
+                "state_covariances must have shape "
+                f"({self.n_states}, {self.lpc_order}, {self.lpc_order})"
+            )
 
         caches = self._caches
         if caches.chol_factors is not None and len(caches.chol_factors) == self.n_states:
             return
 
+        covariances = np.asarray(self.state_covariances, dtype=np.float64).copy()
         chol_cache: List[np.ndarray] = []
         log_det_cache = np.empty(self.n_states, dtype=np.float64)
+        eye = np.eye(self.lpc_order, dtype=np.float64)
 
         for state in range(self.n_states):
-            cov = self.state_covariances[state]
-            try:
-                chol = cholesky(cov, lower=True, overwrite_a=False, check_finite=False)
-            except LinAlgError:
-                cov = cov + np.eye(self.lpc_order) * 1e-4
-                self.state_covariances[state] = cov
-                chol = cholesky(cov, lower=True, overwrite_a=False, check_finite=False)
-
+            cov = self._regularize_covariance(covariances[state])
+            jitter = 0.0
+            for attempt in range(8):
+                try:
+                    chol = cholesky(
+                        cov + eye * jitter,
+                        lower=True,
+                        overwrite_a=False,
+                        check_finite=False,
+                    )
+                    if jitter:
+                        cov = cov + eye * jitter
+                    break
+                except LinAlgError:
+                    jitter = self.covariance_floor if attempt == 0 else jitter * 10.0
+            else:
+                eigenvalues, eigenvectors = np.linalg.eigh(cov)
+                cov = (eigenvectors * np.maximum(eigenvalues, self.covariance_floor)) @ eigenvectors.T
+                cov = 0.5 * (cov + cov.T)
+                chol = cholesky(cov, lower=True, check_finite=False)
+            covariances[state] = cov
             chol_cache.append(chol)
             log_det_cache[state] = 2.0 * np.sum(np.log(np.diag(chol)))
 
+        # Keep any repaired matrix in the model, but avoid triggering cache reset here.
+        self._params.state_covariances = covariances
         caches.chol_factors = chol_cache
         caches.log_determinants = log_det_cache
 
@@ -472,6 +669,10 @@ class SpectralStateGuidedSynthesis:
 
         if matrix.ndim != 2:
             raise ValueError("Feature matrix must be 2-D")
+        if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+            raise ValueError("Feature matrix must be non-empty")
+        if not np.all(np.isfinite(matrix)):
+            raise ValueError("Feature matrix contains NaN or infinite values")
 
         return matrix, tuple(metadata_keys)
 
@@ -513,6 +714,8 @@ class SpectralStateGuidedSynthesis:
 
         if arr.ndim != 1:
             raise ValueError("Feature query vector must be 1-D")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("Feature query vector must contain only finite values")
 
         expected = index.tree.m
         if arr.shape[0] != expected:
@@ -533,8 +736,10 @@ class SpectralStateGuidedSynthesis:
         include_metadata=True,
     ):
         """Return the nearest frames to the provided frame index in feature space."""
-        if k < 1:
-            raise ValueError("k must be >= 1")
+        if isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer)) or k < 1:
+            raise ValueError("k must be a positive integer")
+        if isinstance(frame_idx, (bool, np.bool_)) or not isinstance(frame_idx, (int, np.integer)):
+            raise IndexError("frame_idx must be an integer")
 
         index = self.build_feature_index(feature_space, normalize=normalize)
 
@@ -577,8 +782,8 @@ class SpectralStateGuidedSynthesis:
         include_metadata=True,
     ):
         """Nearest-neighbor query using an explicit feature vector."""
-        if k < 1:
-            raise ValueError("k must be >= 1")
+        if isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer)) or k < 1:
+            raise ValueError("k must be a positive integer")
 
         index = self.build_feature_index(feature_space, normalize=normalize)
         encoded = self._encode_feature_vector(vector, feature_space, index)
@@ -630,8 +835,8 @@ class SpectralStateGuidedSynthesis:
         """Rank frames by a metadata metric and return the top results."""
         if metric not in self.frame_metadata:
             raise KeyError(f"Unknown metadata metric '{metric}'")
-        if k < 1:
-            raise ValueError("k must be >= 1")
+        if isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer)) or k < 1:
+            raise ValueError("k must be a positive integer")
 
         values = self.frame_metadata[metric]
         total = values.shape[0]
@@ -653,31 +858,93 @@ class SpectralStateGuidedSynthesis:
             feature_space=f"rank:{metric}",
         )
 
+    @staticmethod
+    def _coerce_sample_rate(sample_rate, name="sample_rate"):
+        if isinstance(sample_rate, (bool, np.bool_)) or not isinstance(sample_rate, (int, np.integer)):
+            raise ValueError(f"{name} must be a positive integer")
+        sample_rate = int(sample_rate)
+        if sample_rate <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return sample_rate
+
+    def _prepare_audio(self, audio_signal, source_sample_rate, target_sample_rate=None):
+        """Validate audio, downmix channels, and band-limited-resample if needed."""
+        source_sample_rate = self._coerce_sample_rate(source_sample_rate, "source_sample_rate")
+        target_sample_rate = self._coerce_sample_rate(
+            source_sample_rate if target_sample_rate is None else target_sample_rate,
+            "target_sample_rate",
+        )
+        raw = np.asarray(audio_signal)
+        if raw.dtype.kind not in "fiu":
+            raise ValueError("audio_signal must contain real numeric samples")
+        integer_input = raw.dtype.kind in "iu"
+        integer_scale = None
+        integer_offset = 0.0
+        if integer_input:
+            limits = np.iinfo(raw.dtype)
+            if raw.dtype.kind == "u":
+                integer_offset = float(limits.max + 1) / 2.0
+                integer_scale = integer_offset
+            else:
+                integer_scale = float(max(abs(limits.min), abs(limits.max)))
+        if raw.ndim == 2:
+            if raw.shape[0] == 0 or raw.shape[1] == 0:
+                raise ValueError("audio_signal must contain at least one sample and channel")
+            # soundfile's standard layout is (samples, channels); average avoids
+            # phase-dependent selection of a single channel.
+            raw = raw.astype(np.float64, copy=False).mean(axis=1)
+        elif raw.ndim != 1:
+            raise ValueError("audio_signal must be mono (1-D) or samples-by-channels (2-D)")
+        if integer_input:
+            audio = (raw.astype(np.float64) - integer_offset) / integer_scale
+        else:
+            audio = raw.astype(np.float64, copy=False)
+        if audio.size == 0:
+            raise ValueError("audio_signal is empty")
+        if not np.all(np.isfinite(audio)):
+            raise ValueError("audio_signal contains NaN or infinite samples")
+        if source_sample_rate != target_sample_rate:
+            divisor = math.gcd(source_sample_rate, target_sample_rate)
+            audio = signal.resample_poly(
+                audio,
+                target_sample_rate // divisor,
+                source_sample_rate // divisor,
+            )
+        if audio.size == 0 or not np.all(np.isfinite(audio)):
+            raise ValueError("audio preprocessing produced no finite samples")
+        return np.ascontiguousarray(audio, dtype=np.float32)
+
     def _frame_signal(self, audio_signal):
-        """
-        Convert audio signal into overlapping frames using stride tricks.
-        """
+        """Frame mono audio with complete coverage and deterministic zero padding."""
         audio_signal = np.asarray(audio_signal, dtype=np.float32)
         if audio_signal.ndim != 1:
-            raise ValueError("audio_signal must be 1-D")
+            raise ValueError("audio_signal must be 1-D; downmix channels before framing")
+        if audio_signal.size == 0:
+            raise ValueError("audio_signal is empty")
+        if not np.all(np.isfinite(audio_signal)):
+            raise ValueError("audio_signal contains NaN or infinite samples")
 
-        if len(audio_signal) < self.frame_size:
-            pad_width = self.frame_size - len(audio_signal)
-            audio_signal = np.pad(audio_signal, (0, pad_width), mode="constant")
+        n_samples = audio_signal.size
+        if n_samples < self.frame_size:
+            target_length = self.frame_size
+        else:
+            trailing = (n_samples - self.frame_size) % self.hop_size
+            target_length = n_samples if trailing == 0 else n_samples + self.hop_size - trailing
+        if target_length != n_samples:
+            audio_signal = np.pad(audio_signal, (0, target_length - n_samples), mode="constant")
 
-        remainder = len(audio_signal) % self.hop_size
-        if remainder:
-            pad_width = self.hop_size - remainder
-            audio_signal = np.pad(audio_signal, (0, pad_width), mode="constant")
-
-        total_frames = 1 + (len(audio_signal) - self.frame_size) // self.hop_size
-        shape = (total_frames, self.frame_size)
-        strides = (audio_signal.strides[0] * self.hop_size, audio_signal.strides[0])
-        frames = np.lib.stride_tricks.as_strided(audio_signal, shape=shape, strides=strides)
-        return frames.copy()
+        # sliding_window_view is safer than hand-crafted as_strided shapes/strides;
+        # slicing retains the repository's exact frame/hop convention.
+        frames = np.lib.stride_tricks.sliding_window_view(audio_signal, self.frame_size)
+        return np.ascontiguousarray(frames[:: self.hop_size], dtype=np.float32)
 
     def _autocorrelation(self, frame):
-        """Compute autocorrelation sequence needed for LPC."""
+        """Compute a finite, lag-limited autocorrelation sequence for LPC."""
+        frame = np.asarray(frame, dtype=np.float64)
+        if frame.ndim != 1 or frame.size <= self.lpc_order:
+            raise ValueError("frame must be 1-D and longer than lpc_order")
+        if not np.all(np.isfinite(frame)):
+            raise ValueError("frame contains NaN or infinite samples")
         corr = np.correlate(frame, frame, mode="full")
         mid = len(frame) - 1
         return corr[mid : mid + self.lpc_order + 1]
@@ -728,12 +995,14 @@ class SpectralStateGuidedSynthesis:
         return lpc_coeffs, residual
 
     def _mel_filter_bank(self, sample_rate, n_fft, n_mels=32, fmin=20.0, fmax=None):
-        if sample_rate <= 0:
-            raise ValueError("sample_rate must be positive")
-        if fmax is None:
-            fmax = sample_rate / 2.0
-        if fmax <= fmin:
-            raise ValueError("fmax must be greater than fmin for mel filter bank")
+        sample_rate = self._coerce_sample_rate(sample_rate)
+        if isinstance(n_fft, (bool, np.bool_)) or not isinstance(n_fft, (int, np.integer)) or n_fft <= 1:
+            raise ValueError("n_fft must be an integer greater than one")
+        if isinstance(n_mels, (bool, np.bool_)) or not isinstance(n_mels, (int, np.integer)) or n_mels <= 0:
+            raise ValueError("n_mels must be a positive integer")
+        fmax = sample_rate / 2.0 if fmax is None else float(fmax)
+        if not np.isfinite(fmin) or not np.isfinite(fmax) or fmin < 0 or fmax <= fmin or fmax > sample_rate / 2.0:
+            raise ValueError("mel frequency bounds must satisfy 0 <= fmin < fmax <= Nyquist")
 
         n_fft_bins = n_fft // 2 + 1
 
@@ -772,12 +1041,14 @@ class SpectralStateGuidedSynthesis:
         return filters
 
     def _erb_filter_bank(self, sample_rate, n_fft, n_bands=16, fmin=30.0, fmax=None):
-        if sample_rate <= 0:
-            raise ValueError("sample_rate must be positive")
-        if fmax is None:
-            fmax = sample_rate / 2.0
-        if fmax <= fmin:
-            raise ValueError("fmax must be greater than fmin for ERB filter bank")
+        sample_rate = self._coerce_sample_rate(sample_rate)
+        if isinstance(n_fft, (bool, np.bool_)) or not isinstance(n_fft, (int, np.integer)) or n_fft <= 1:
+            raise ValueError("n_fft must be an integer greater than one")
+        if isinstance(n_bands, (bool, np.bool_)) or not isinstance(n_bands, (int, np.integer)) or n_bands <= 0:
+            raise ValueError("n_bands must be a positive integer")
+        fmax = sample_rate / 2.0 if fmax is None else float(fmax)
+        if not np.isfinite(fmin) or not np.isfinite(fmax) or fmin < 0 or fmax <= fmin or fmax > sample_rate / 2.0:
+            raise ValueError("ERB frequency bounds must satisfy 0 <= fmin < fmax <= Nyquist")
 
         n_fft_bins = n_fft // 2 + 1
 
@@ -839,6 +1110,13 @@ class SpectralStateGuidedSynthesis:
         window,
         energy_threshold=1e-10,
     ):
+        frames = np.asarray(frames, dtype=np.float32)
+        if frames.ndim != 2 or frames.shape[1] != self.frame_size:
+            raise ValueError(f"frames must have shape (n, {self.frame_size})")
+        if not np.all(np.isfinite(frames)):
+            raise ValueError("frames contain NaN or infinite samples")
+        if not np.isfinite(energy_threshold) or energy_threshold < 0:
+            raise ValueError("energy_threshold must be finite and non-negative")
         lpc_coeffs_list: List[np.ndarray] = []
         residual_list: List[np.ndarray] = []
         retained_frames: List[np.ndarray] = []
@@ -889,6 +1167,8 @@ class SpectralStateGuidedSynthesis:
             lpc_coeffs_matrix: Matrix of LPC coefficients for all frames
             residual_matrix: Matrix of residual signals
         """
+        sample_rate = self._coerce_sample_rate(sample_rate)
+        audio_signal = self._prepare_audio(audio_signal, sample_rate, sample_rate)
         frames = self._frame_signal(audio_signal)
 
         mel_filters = self._mel_filter_bank(sample_rate, self.frame_size)
@@ -913,6 +1193,7 @@ class SpectralStateGuidedSynthesis:
             raise ValueError("No valid frames extracted; check input signal")
 
         self.spectral_flux = flux_values.astype(np.float32, copy=False)
+        self.sequence_starts = np.array([0], dtype=np.int64)
 
         self._compute_frame_metadata(self.sample_rate)
         if self.spectral_flux is not None and self.spectral_flux.size:
@@ -925,11 +1206,14 @@ class SpectralStateGuidedSynthesis:
         return self.lpc_coefficients, self.residual_signals
 
     def _extract_features_for_adaptation(self, audio_signal, sample_rate):
-        """Extract features from new audio without overwriting existing training buffers."""
+        """Extract new audio at the model's analysis rate without replacing buffers."""
+        sample_rate = self._coerce_sample_rate(sample_rate)
+        analysis_rate = self.sample_rate or sample_rate
+        audio_signal = self._prepare_audio(audio_signal, sample_rate, analysis_rate)
         frames = self._frame_signal(audio_signal)
 
-        mel_filters = self._mel_filter_bank(sample_rate, self.frame_size)
-        erb_filters = self._erb_filter_bank(sample_rate, self.frame_size)
+        mel_filters = self._mel_filter_bank(analysis_rate, self.frame_size)
+        erb_filters = self._erb_filter_bank(analysis_rate, self.frame_size)
         window = np.hanning(self.frame_size).astype(np.float32)
 
         (
@@ -983,9 +1267,11 @@ class SpectralStateGuidedSynthesis:
         erb_filters = self._erb_filter_bank(self.sample_rate, self.frame_size)
         window = np.hanning(self.frame_size).astype(np.float32)
 
+        original_starts = self._normalize_sequence_starts(len(self.training_frames))
         augmented_frames = [self.training_frames]
         augmented_lpc = [self.lpc_coefficients]
         augmented_residuals = [self.residual_signals]
+        augmented_sequence_starts = original_starts.tolist()
 
         augmented_perceptual: List[np.ndarray] = []
         if self.perceptual_features is not None and self.perceptual_features.size:
@@ -1005,6 +1291,8 @@ class SpectralStateGuidedSynthesis:
             ) = self._process_frame_batch(batch, mel_filters, erb_filters, window)
             if lpc_aug.size == 0:
                 return
+            offset = sum(len(item) for item in augmented_frames)
+            augmented_sequence_starts.extend((original_starts + offset).tolist())
             augmented_frames.append(frames_aug)
             augmented_lpc.append(lpc_aug)
             augmented_residuals.append(residual_aug)
@@ -1035,6 +1323,7 @@ class SpectralStateGuidedSynthesis:
         self.training_frames = np.concatenate(augmented_frames, axis=0)
         self.lpc_coefficients = np.concatenate(augmented_lpc, axis=0)
         self.residual_signals = np.concatenate(augmented_residuals, axis=0)
+        self.sequence_starts = np.asarray(augmented_sequence_starts, dtype=np.int64)
 
         if augmented_perceptual:
             self.perceptual_features = np.concatenate(augmented_perceptual, axis=0)
@@ -1064,8 +1353,14 @@ class SpectralStateGuidedSynthesis:
         """
         if self.lpc_coefficients is None:
             raise ValueError("Must extract features first")
+        if isinstance(n_states, (bool, np.bool_)) or not isinstance(n_states, (int, np.integer)) or n_states <= 0:
+            raise ValueError("n_states must be a positive integer")
+        if isinstance(n_em_iterations, (bool, np.bool_)) or not isinstance(n_em_iterations, (int, np.integer)) or n_em_iterations < 0:
+            raise ValueError("n_em_iterations must be a non-negative integer")
         
         num_frames = self.lpc_coefficients.shape[0]
+        if num_frames <= 0 or n_states > num_frames:
+            raise ValueError("n_states must not exceed the number of extracted frames")
         
         # Save current state
         original_n_states = self.n_states
@@ -1100,9 +1395,13 @@ class SpectralStateGuidedSynthesis:
             feature_std = clustering_features.std(axis=0) + 1e-6
             normalized_features = (clustering_features - feature_mean) / feature_std
             
-            centroids, labels = vq.kmeans2(normalized_features, n_states, minit="++", iter=20)
+            seed = int(self._rng.integers(0, np.iinfo(np.int32).max))
+            centroids, labels = vq.kmeans2(
+                normalized_features, n_states, minit="++", iter=20, seed=seed
+            )
             if isinstance(labels, tuple):
                 labels = labels[0]
+            labels = np.asarray(labels, dtype=np.int64)
             
             self.initial_probabilities = np.zeros(n_states, dtype=np.float64)
             self.transition_matrix = np.zeros((n_states, n_states), dtype=np.float64)
@@ -1124,12 +1423,11 @@ class SpectralStateGuidedSynthesis:
                 cov += np.eye(self.lpc_order) * 1e-4
                 self.state_covariances[state] = cov
             
-            for idx, state in enumerate(labels):
-                if idx == 0:
-                    self.initial_probabilities[state] += 1.0
-                else:
-                    prev_state = labels[idx - 1]
-                    self.transition_matrix[prev_state, state] += 1.0
+            starts = self._normalize_sequence_starts(num_frames)
+            for start, end in self._sequence_slices(num_frames, starts):
+                self.initial_probabilities[labels[start]] += 1.0
+                for idx in range(start + 1, end):
+                    self.transition_matrix[labels[idx - 1], labels[idx]] += 1.0
             
             self.initial_probabilities += 1e-3
             self.initial_probabilities /= self.initial_probabilities.sum()
@@ -1189,11 +1487,28 @@ class SpectralStateGuidedSynthesis:
         """
         if candidate_counts is None:
             candidate_counts = self.DEFAULT_BIC_CANDIDATES
-        
-        print(f"Auto-selecting n_states from candidates: {candidate_counts}")
+        if self.lpc_coefficients is None or len(self.lpc_coefficients) == 0:
+            raise ValueError("Must extract features before selecting n_states")
+        if isinstance(candidate_counts, (str, bytes)):
+            raise ValueError("candidate_counts must be a non-empty iterable of positive integers")
+        try:
+            candidate_values = list(candidate_counts)
+        except TypeError as exc:
+            raise ValueError("candidate_counts must be a non-empty iterable of positive integers") from exc
+        candidates = []
+        for value in candidate_values:
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value <= 0:
+                raise ValueError("candidate state counts must be positive integers")
+            if int(value) not in candidates:
+                candidates.append(int(value))
+        if not candidates:
+            raise ValueError("candidate_counts must contain at least one state count")
+        if not any(value <= len(self.lpc_coefficients) for value in candidates):
+            candidates = [min(self.n_states, len(self.lpc_coefficients))]
+        print(f"Auto-selecting n_states from candidates: {candidates}")
         
         bic_scores = {}
-        for n in candidate_counts:
+        for n in candidates:
             if n > len(self.lpc_coefficients):
                 print(f"  Skipping n_states={n} (exceeds frame count)")
                 continue
@@ -1215,89 +1530,115 @@ class SpectralStateGuidedSynthesis:
         return optimal_n_states
 
     def initialize_hmm_parameters(self):
-        """
-        Phase 1, Step 2: State Initialization using Clustering
-        
-        Uses k-means clustering to initialize HMM parameters from LPC coefficients.
-        If auto_n_states=True, automatically selects optimal state count using BIC.
-        """
+        """Initialize a well-conditioned Gaussian HMM from LPC/perceptual features."""
         if self.lpc_coefficients is None:
             raise ValueError("Must extract features first using extract_features()")
+        if self.lpc_coefficients.ndim != 2 or self.lpc_coefficients.shape[1] != self.lpc_order:
+            raise ValueError(f"lpc_coefficients must have shape (n, {self.lpc_order})")
         if self.lpc_coefficients.shape[0] == 0:
-            raise ValueError(
-                "No frames extracted; check input audio content and sample_rate."
-            )
+            raise ValueError("No frames extracted; check input audio content and sample_rate.")
+        if not np.all(np.isfinite(self.lpc_coefficients)):
+            raise ValueError("LPC features contain NaN or infinite values")
 
         self._apply_residual_augmentation()
-        
-        # Auto-select n_states if enabled
         if self.auto_n_states:
             self.n_states = self._select_optimal_n_states()
 
-        num_frames = self.lpc_coefficients.shape[0]
+        num_frames = int(self.lpc_coefficients.shape[0])
         if num_frames < self.n_states:
             warnings.warn(
                 "Fewer frames than states; reducing state count for initialization",
                 RuntimeWarning,
+                stacklevel=2,
             )
             self.n_states = num_frames
 
-        coeff_mean = np.mean(self.lpc_coefficients, axis=0)
-
         if (
             self.perceptual_features is not None
+            and self.perceptual_features.ndim == 2
             and self.perceptual_features.shape[0] == num_frames
         ):
-            clustering_features = np.hstack([
-                self.lpc_coefficients,
-                self.perceptual_features,
-            ])
+            clustering_features = np.hstack((self.lpc_coefficients, self.perceptual_features))
         else:
             clustering_features = self.lpc_coefficients
-
-        clustering_features = clustering_features.astype(np.float64, copy=False)
+        clustering_features = np.asarray(clustering_features, dtype=np.float64)
+        if not np.all(np.isfinite(clustering_features)):
+            raise ValueError("Clustering features contain NaN or infinite values")
         feature_mean = clustering_features.mean(axis=0)
-        feature_std = clustering_features.std(axis=0) + 1e-6
-        normalized_features = (clustering_features - feature_mean) / feature_std
+        feature_std = clustering_features.std(axis=0)
+        feature_std = np.where(feature_std < 1e-8, 1.0, feature_std)
+        normalized = (clustering_features - feature_mean) / feature_std
 
-        centroids, labels = vq.kmeans2(normalized_features, self.n_states, minit="++", iter=40)
-        if isinstance(labels, tuple):  # Older scipy returns (labels, dist)
+        seed = int(self._rng.integers(0, np.iinfo(np.int32).max))
+        try:
+            centroids, labels = vq.kmeans2(
+                normalized,
+                self.n_states,
+                minit="++",
+                iter=40,
+                seed=seed,
+            )
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            logger.warning("k-means++ initialization failed (%s); using deterministic point seeding", exc)
+            rng = np.random.default_rng(seed)
+            centers = normalized[rng.choice(num_frames, size=self.n_states, replace=False)]
+            distances = np.sum((normalized[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            labels = np.argmin(distances, axis=1)
+            centroids = centers
+        if isinstance(labels, tuple):
             labels = labels[0]
+        labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+        if labels.shape[0] != num_frames or np.any(labels < 0) or np.any(labels >= self.n_states):
+            raise RuntimeError("k-means returned malformed state assignments")
 
-        self.initial_probabilities = np.zeros(self.n_states, dtype=np.float64)
-        self.transition_matrix = np.zeros((self.n_states, self.n_states), dtype=np.float64)
-        self.state_means = np.zeros((self.n_states, self.lpc_order), dtype=np.float64)
-        self.state_covariances = np.array(
-            [np.eye(self.lpc_order, dtype=np.float64) * 0.05 for _ in range(self.n_states)]
-        )
+        # kmeans2 can leave clusters empty (especially on constant or very short data).
+        counts = np.bincount(labels, minlength=self.n_states)
+        current_distances = np.sum((normalized - centroids[labels]) ** 2, axis=1)
+        for empty_state in np.flatnonzero(counts == 0):
+            candidates = counts[labels] > 1
+            if not np.any(candidates):
+                candidates = np.ones(num_frames, dtype=bool)
+            candidate_distances = np.where(candidates, current_distances, -np.inf)
+            frame_idx = int(np.argmax(candidate_distances))
+            old_state = int(labels[frame_idx])
+            labels[frame_idx] = int(empty_state)
+            counts[old_state] -= 1
+            counts[empty_state] += 1
+            centroids[empty_state] = normalized[frame_idx]
+            current_distances[frame_idx] = 0.0
 
-        # Recover means in original scale
+        global_mean = np.mean(self.lpc_coefficients, axis=0, dtype=np.float64)
+        centered_global = self.lpc_coefficients.astype(np.float64) - global_mean
+        global_cov = centered_global.T @ centered_global / max(num_frames - 1, 1)
+        global_cov = self._regularize_covariance(global_cov)
+
+        means = np.empty((self.n_states, self.lpc_order), dtype=np.float64)
+        covariances = np.empty((self.n_states, self.lpc_order, self.lpc_order), dtype=np.float64)
         for state in range(self.n_states):
-            mask = labels == state
-            if not np.any(mask):
-                self.state_means[state] = coeff_mean
-                continue
-            state_coeffs = self.lpc_coefficients[mask]
-            self.state_means[state] = state_coeffs.mean(axis=0)
-            centered = state_coeffs - self.state_means[state]
-            cov = np.dot(centered.T, centered) / (len(state_coeffs) - 1 + 1e-9)
-            cov += np.eye(self.lpc_order) * 1e-4
-            self.state_covariances[state] = cov
-
-        for idx, state in enumerate(labels):
-            if idx == 0:
-                self.initial_probabilities[state] += 1.0
+            state_coeffs = self.lpc_coefficients[labels == state].astype(np.float64)
+            means[state] = state_coeffs.mean(axis=0)
+            if len(state_coeffs) > 1:
+                centered = state_coeffs - means[state]
+                cov = centered.T @ centered / (len(state_coeffs) - 1)
             else:
-                prev_state = labels[idx - 1]
-                self.transition_matrix[prev_state, state] += 1.0
+                cov = global_cov.copy()
+            covariances[state] = self._regularize_covariance(cov)
 
-        self.initial_probabilities += 1e-3
-        self.initial_probabilities /= self.initial_probabilities.sum()
+        starts = self._normalize_sequence_starts(num_frames)
+        start_set = set(starts.tolist())
+        initial_counts = np.full(self.n_states, self.transition_pseudocount, dtype=np.float64)
+        transition_counts = np.full(
+            (self.n_states, self.n_states), self.transition_pseudocount, dtype=np.float64
+        )
+        for start, end in self._sequence_slices(num_frames, starts):
+            initial_counts[labels[start]] += 1.0
+            for idx in range(start + 1, end):
+                transition_counts[labels[idx - 1], labels[idx]] += 1.0
 
-        self.transition_matrix += 1e-6
-        row_sums = self.transition_matrix.sum(axis=1, keepdims=True)
-        self.transition_matrix /= row_sums
-
+        self.initial_probabilities = self._normalize_probabilities(initial_counts)
+        self.transition_matrix = self._normalize_probabilities(transition_counts, axis=1)
+        self.state_means = means
+        self.state_covariances = covariances
         self._reset_caches()
         self._caches.training_history.clear()
         self._compute_and_cache_cholesky_factors()
@@ -1310,6 +1651,9 @@ class SpectralStateGuidedSynthesis:
         memory_blend: float,
         memory_limit: int,
     ) -> None:
+        for name, value in (("adaptation_rate", adaptation_rate), ("stability_bias", stability_bias), ("memory_blend", memory_blend)):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number)) or not np.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
         if not 0.0 <= adaptation_rate <= 1.0:
             raise ValueError("adaptation_rate must be between 0.0 and 1.0")
         if not 0.0 <= stability_bias <= 1.0:
@@ -1319,19 +1663,24 @@ class SpectralStateGuidedSynthesis:
         if memory_limit <= 0:
             raise ValueError("memory_limit must be > 0")
 
-    def _compute_statistics_from_observations(self, observations, gamma, xi):
+    def _compute_statistics_from_observations(
+        self, observations, gamma, xi, sequence_starts=None
+    ):
+        observations = np.asarray(observations, dtype=np.float64)
+        gamma = np.asarray(gamma, dtype=np.float64)
+        if observations.ndim != 2 or observations.shape[1] != self.lpc_order:
+            raise ValueError(f"observations must have shape (n, {self.lpc_order})")
+        if gamma.shape != (len(observations), self.n_states):
+            raise ValueError("gamma shape does not match observations and model states")
+        starts = self._normalize_sequence_starts(len(observations), sequence_starts)
+        expected_transitions = len(observations) - len(starts)
+        if np.shape(xi) != (expected_transitions, self.n_states, self.n_states):
+            raise ValueError("xi shape does not match observations and sequence boundaries")
         counts = gamma.sum(axis=0)
         mean_accumulator = gamma.T @ observations
-        second_moment = np.zeros(
-            (self.n_states, self.lpc_order, self.lpc_order),
-            dtype=np.float64,
-        )
-        for state in range(self.n_states):
-            weights = gamma[:, state][:, None]
-            weighted = observations * weights
-            second_moment[state] = weighted.T @ observations
-        transition_counts = xi.sum(axis=0)
-        initial_counts = gamma[0].copy()
+        second_moment = np.einsum("ts,ti,tj->sij", gamma, observations, observations, optimize=True)
+        transition_counts = np.asarray(xi, dtype=np.float64).sum(axis=0)
+        initial_counts = gamma[starts].sum(axis=0)
         total_frames = float(observations.shape[0])
         return counts, transition_counts, mean_accumulator, second_moment, initial_counts, total_frames
 
@@ -1352,7 +1701,10 @@ class SpectralStateGuidedSynthesis:
             initial_counts = self.initial_probabilities.astype(np.float64, copy=True)
             total_frames = float(self.n_states)
         else:
-            gamma, xi, _ = self._expectation_step(self.lpc_coefficients)
+            starts = self._normalize_sequence_starts(len(self.lpc_coefficients))
+            gamma, xi, _ = self._expectation_step(
+                self.lpc_coefficients, sequence_starts=starts
+            )
             (
                 counts,
                 transition_counts,
@@ -1360,7 +1712,9 @@ class SpectralStateGuidedSynthesis:
                 second_moment,
                 initial_counts,
                 total_frames,
-            ) = self._compute_statistics_from_observations(self.lpc_coefficients, gamma, xi)
+            ) = self._compute_statistics_from_observations(
+                self.lpc_coefficients, gamma, xi, sequence_starts=starts
+            )
 
         self._adaptive_stats = _AdaptiveStatistics(
             state_frame_counts=counts,
@@ -1380,6 +1734,7 @@ class SpectralStateGuidedSynthesis:
         *,
         adaptation_rate: float,
         stability_bias: float,
+        sequence_starts=None,
     ) -> None:
         if self._adaptive_stats is None:
             self._bootstrap_adaptive_statistics()
@@ -1391,7 +1746,9 @@ class SpectralStateGuidedSynthesis:
             new_second_moment,
             new_initial,
             new_total,
-        ) = self._compute_statistics_from_observations(observations, gamma, xi)
+        ) = self._compute_statistics_from_observations(
+            observations, gamma, xi, sequence_starts=sequence_starts
+        )
 
         stats = self._adaptive_stats
         if stats is None:
@@ -1420,49 +1777,39 @@ class SpectralStateGuidedSynthesis:
         stats = self._adaptive_stats
         if stats is None:
             return
-
+        prior = float(max(stability_bias, 0.0))
         counts = np.clip(stats.state_frame_counts, 1e-6, None)
 
-        # Dirichlet prior of strength ``stability_bias`` toward a uniform distribution.
-        # This guards against degenerate (all-zero) probabilities without distorting the
-        # reconstructed means/covariances, which use the (clipped) raw accumulators.
-        prior = float(max(stability_bias, 0.0))
+        initial_counts = stats.initial_counts + prior
+        if float(initial_counts.sum()) <= 0:
+            initial_counts = np.asarray(self.initial_probabilities, dtype=np.float64).copy()
+        initial = self._normalize_probabilities(initial_counts)
+
+        transition_counts = np.asarray(stats.transition_counts, dtype=np.float64).copy()
+        empty_rows = transition_counts.sum(axis=1) <= 0
         if prior > 0.0:
-            initial_denom = stats.initial_counts.sum() + self.n_states * prior
-            self.initial_probabilities = (stats.initial_counts + prior) / initial_denom
-
-            row_denom = (
-                np.sum(stats.transition_counts, axis=1, keepdims=True)
-                + self.n_states * prior
-            )
-            transition = (stats.transition_counts + prior) / row_denom
-        else:
-            self.initial_probabilities = stats.initial_counts / np.sum(stats.initial_counts)
-            transition = stats.transition_counts / np.sum(
-                stats.transition_counts, axis=1, keepdims=True
-            )
-
+            transition_counts += prior
+        if np.any(empty_rows):
+            transition_counts[empty_rows] = np.asarray(self.transition_matrix)[empty_rows]
+        transition = self._normalize_probabilities(
+            transition_counts,
+            axis=1,
+            fallback=self.transition_matrix,
+        )
         transition = np.clip(transition, 1e-12, None)
-        transition /= transition.sum(axis=1, keepdims=True)
-        self.transition_matrix = transition
-
+        transition = self._normalize_probabilities(transition, axis=1)
         means = stats.mean_accumulator / counts[:, None]
-        self.state_means = means
 
         covariances = np.empty((self.n_states, self.lpc_order, self.lpc_order), dtype=np.float64)
         for state in range(self.n_states):
             second = stats.second_moment_accumulator[state] / counts[state]
             mean = means[state]
             cov = second - np.outer(mean, mean)
-            cov += np.eye(self.lpc_order) * self.COVARIANCE_REGULARIZATION_EPSILON
-            cov_eigs = np.linalg.eigvalsh(cov)
-            min_eig = float(np.min(cov_eigs))
-            if min_eig < self.COVARIANCE_MIN_EIGENVALUE:
-                cov += np.eye(self.lpc_order) * (
-                    self.COVARIANCE_MIN_EIGENVALUE - min_eig + self.COVARIANCE_REGULARIZATION_EPSILON
-                )
-            covariances[state] = cov
+            covariances[state] = self._regularize_covariance(cov)
 
+        self.initial_probabilities = initial
+        self.transition_matrix = transition
+        self.state_means = means
         self.state_covariances = covariances
         self._reset_caches()
         self._compute_and_cache_cholesky_factors()
@@ -1486,8 +1833,10 @@ class SpectralStateGuidedSynthesis:
             self.residual_signals = residuals
             self.perceptual_features = perceptual_vectors
             self.spectral_flux = flux_values
+            self.sequence_starts = np.array([0], dtype=np.int64)
         else:
             existing_frames = self.training_frames
+            existing_starts = self._normalize_sequence_starts(len(existing_frames))
             existing_lpc = self.lpc_coefficients
             existing_residuals = self.residual_signals
             existing_perceptual = self.perceptual_features
@@ -1517,6 +1866,9 @@ class SpectralStateGuidedSynthesis:
                     and flux_values.size
                 ):
                     self.spectral_flux = np.concatenate([existing_flux, flux_values], axis=0)
+                self.sequence_starts = np.concatenate(
+                    (existing_starts, np.array([total_existing], dtype=np.int64))
+                )
             else:
                 target_old = int(round(memory_limit * memory_blend))
                 target_new = memory_limit - target_old
@@ -1541,6 +1893,10 @@ class SpectralStateGuidedSynthesis:
                 self.training_frames = merged_frames
                 self.lpc_coefficients = merged_lpc
                 self.residual_signals = merged_residuals
+                # Reservoir samples no longer form a meaningful temporal sequence.
+                # Treat each retained frame independently rather than fabricating
+                # transitions between randomly reordered frames.
+                self.sequence_starts = np.arange(len(merged_frames), dtype=np.int64)
 
                 if (
                     existing_perceptual is not None
@@ -1640,153 +1996,176 @@ class SpectralStateGuidedSynthesis:
         self._caches.psychoacoustic_weight = combined
         return combined
 
-    def _expectation_step(self, observations):
-        """
-        E-step: Compute posterior probabilities of state sequences
-        
-        Args:
-            observations: LPC coefficient sequences
-            
-        Returns:
-            gamma: State posterior probabilities
-            xi: Transition posterior probabilities
-        """
-        n_frames = observations.shape[0]
-        log_emissions = self._compute_emission_log_probs(observations)
+    def _expectation_step(self, observations, sequence_starts=None):
+        """Run stable log-domain forward/backward independently per audio sequence."""
+        observations = np.asarray(observations, dtype=np.float64)
+        if observations.ndim != 2 or observations.shape[1] != self.lpc_order:
+            raise ValueError(f"observations must have shape (n, {self.lpc_order})")
+        if not np.all(np.isfinite(observations)):
+            raise ValueError("observations contain NaN or infinite values")
+        slices = self._sequence_slices(len(observations), sequence_starts)
+        if self.transition_matrix is None or self.initial_probabilities is None:
+            raise ValueError(_ERR_HMM_NOT_INITIALIZED)
+        if self.state_means is None or self.state_covariances is None:
+            raise ValueError("Gaussian emission parameters are not initialized")
 
-        if _NATIVE_BACKEND_AVAILABLE:
-            log_init = np.log(self.initial_probabilities + 1e-12)
-            log_trans = np.log(self.transition_matrix + 1e-12)
-            gamma, xi, log_likelihood = ssgs_native.forward_backward(
-                np.ascontiguousarray(log_emissions, dtype=np.float64),
-                np.ascontiguousarray(log_init, dtype=np.float64),
-                np.ascontiguousarray(log_trans, dtype=np.float64),
-            )
-            return gamma, xi, float(log_likelihood)
+        initial = self._normalize_probabilities(self.initial_probabilities)
+        transition = self._normalize_probabilities(self.transition_matrix, axis=1)
+        log_init = np.log(np.clip(initial, np.finfo(np.float64).tiny, None))
+        log_trans = np.log(np.clip(transition, np.finfo(np.float64).tiny, None))
+        gamma = np.empty((len(observations), self.n_states), dtype=np.float64)
+        xi_parts = []
+        total_log_likelihood = 0.0
 
-        log_init = np.log(self.initial_probabilities + 1e-12)
-        log_trans = np.log(self.transition_matrix + 1e-12)
+        for start, end in slices:
+            emissions = self._compute_emission_log_probs(observations[start:end])
+            length = end - start
+            if length == 1:
+                log_posterior = log_init + emissions[0]
+                normalizer = float(logsumexp(log_posterior))
+                gamma[start] = np.exp(log_posterior - normalizer)
+                total_log_likelihood += normalizer
+                continue
 
-        alpha = np.empty((n_frames, self.n_states), dtype=np.float64)
-        beta = np.empty((n_frames, self.n_states), dtype=np.float64)
+            if _NATIVE_BACKEND_AVAILABLE:
+                local_gamma, local_xi, log_likelihood = ssgs_native.forward_backward(
+                    np.ascontiguousarray(emissions, dtype=np.float64),
+                    np.ascontiguousarray(log_init, dtype=np.float64),
+                    np.ascontiguousarray(log_trans, dtype=np.float64),
+                )
+            else:
+                local_gamma, local_xi, log_likelihood = ssgs_core.forward_backward(
+                    emissions, log_init, log_trans
+                )
+            gamma[start:end] = local_gamma
+            xi_parts.append(np.asarray(local_xi, dtype=np.float64))
+            total_log_likelihood += float(log_likelihood)
 
-        alpha[0] = log_init + log_emissions[0]
-        for t in range(1, n_frames):
-            alpha[t] = logsumexp(alpha[t - 1][:, None] + log_trans, axis=0)
-            alpha[t] += log_emissions[t]
+        if xi_parts:
+            xi = np.concatenate(xi_parts, axis=0)
+        else:
+            xi = np.empty((0, self.n_states, self.n_states), dtype=np.float64)
+        if not np.all(np.isfinite(gamma)) or not np.all(np.isfinite(xi)):
+            raise FloatingPointError("forward/backward produced non-finite posteriors")
+        return gamma, xi, float(total_log_likelihood)
 
-        beta[-1] = 0.0
-        for t in range(n_frames - 2, -1, -1):
-            temp = log_trans + log_emissions[t + 1] + beta[t + 1]
-            beta[t] = logsumexp(temp, axis=1)
-
-        log_gamma = alpha + beta
-        log_gamma -= logsumexp(log_gamma, axis=1, keepdims=True)
-        gamma = np.exp(log_gamma)
-
-        log_xi = (
-            alpha[:-1, :, None]
-            + log_trans[np.newaxis, :, :]
-            + log_emissions[1:, None, :]
-            + beta[1:, None, :]
-        )
-        log_xi -= logsumexp(log_xi.reshape(n_frames - 1, -1), axis=1)[:, None, None]
-        xi = np.exp(log_xi)
-
-        log_likelihood = logsumexp(alpha[-1])
-        return gamma, xi, float(log_likelihood)
-    
     def _compute_emission_log_probs(self, observations):
-        """Vectorized Gaussian log-likelihoods for all states."""
-        observations = np.asarray(observations)
+        """Compute finite Gaussian log-likelihoods with cached robust Cholesky factors."""
+        observations = np.asarray(observations, dtype=np.float64)
+        if observations.ndim != 2 or observations.shape[1] != self.lpc_order:
+            raise ValueError(f"observations must have shape (n, {self.lpc_order})")
+        if not np.all(np.isfinite(observations)):
+            raise ValueError("observations contain NaN or infinite values")
         n_frames = observations.shape[0]
-        if _NATIVE_BACKEND_AVAILABLE:
-            return ssgs_native.gaussian_log_probs(
-                np.asarray(self.state_means, dtype=np.float64),
-                np.asarray(self.state_covariances, dtype=np.float64),
-                np.asarray(observations, dtype=np.float64),
-            )
+        if self.state_means is None or np.shape(self.state_means) != (self.n_states, self.lpc_order):
+            raise ValueError("state_means are not initialized with the expected shape")
+        if not np.all(np.isfinite(self.state_means)):
+            raise ValueError("state_means contain NaN or infinite values")
+        if n_frames == 0:
+            return np.empty((0, self.n_states), dtype=np.float64)
+
         self._compute_and_cache_cholesky_factors()
+        if _NATIVE_BACKEND_AVAILABLE:
+            result = ssgs_native.gaussian_log_probs(
+                np.ascontiguousarray(self.state_means, dtype=np.float64),
+                np.ascontiguousarray(self.state_covariances, dtype=np.float64),
+                np.ascontiguousarray(observations, dtype=np.float64),
+            )
+            if not np.all(np.isfinite(result)):
+                raise FloatingPointError("native Gaussian emission kernel returned non-finite values")
+            return result
+
         caches = self._caches
         log_probs = np.empty((n_frames, self.n_states), dtype=np.float64)
         gaussian_const = self.lpc_order * np.log(2.0 * np.pi)
+        obs_t = observations.T
 
-        obs_t = np.asarray(observations).T
-        if obs_t.shape != (self.lpc_order, n_frames):
-            raise ValueError("Unexpected observation matrix shape during emission computation")
-
-        if (
-            caches.emission_observations is None
-            or caches.emission_observations.shape[1] != n_frames
-        ):
-            caches.emission_observations = np.empty((self.lpc_order, n_frames), dtype=np.float64)
-
-        obs_view = caches.emission_observations
-        np.copyto(obs_view, obs_t, casting="safe")
-
-        if (
-            caches.emission_workspace is None
-            or caches.emission_workspace.shape[1] != n_frames
-        ):
-            caches.emission_workspace = np.empty((self.lpc_order, n_frames), dtype=np.float64)
-
+        if caches.emission_observations is None or caches.emission_observations.shape != obs_t.shape:
+            caches.emission_observations = np.empty(obs_t.shape, dtype=np.float64)
+        np.copyto(caches.emission_observations, obs_t)
+        if caches.emission_workspace is None or caches.emission_workspace.shape != obs_t.shape:
+            caches.emission_workspace = np.empty(obs_t.shape, dtype=np.float64)
         workspace = caches.emission_workspace
 
         for state in range(self.n_states):
-            mean = self.state_means[state]
-            chol = caches.chol_factors[state]
-            # Avoid creating large temporaries by reusing the shared workspace buffer.
-            np.subtract(obs_view, mean[:, None], out=workspace)
+            np.subtract(caches.emission_observations, self.state_means[state, :, None], out=workspace)
             solved = solve_triangular(
-                chol,
+                caches.chol_factors[state],
                 workspace,
                 lower=True,
                 check_finite=False,
                 overwrite_b=True,
             )
-            quad = np.sum(solved * solved, axis=0)
+            quadratic = np.sum(solved * solved, axis=0)
             log_probs[:, state] = -0.5 * (
-                quad + gaussian_const + caches.log_determinants[state]
+                quadratic + gaussian_const + caches.log_determinants[state]
             )
-
         return log_probs
-    
-    def _maximization_step(self, observations, gamma, xi):
-        """
-        M-step: Update HMM parameters
-        
-        Args:
-            observations: LPC coefficient sequences
-            gamma: State posterior probabilities
-            xi: Transition posterior probabilities
-        """
-        n_frames = observations.shape[0]
 
-        self.initial_probabilities = gamma[0] + 1e-6
-        self.initial_probabilities /= self.initial_probabilities.sum()
+    def _maximization_step(self, observations, gamma, xi, sequence_starts=None):
+        """Update HMM sufficient statistics without inventing cross-file transitions."""
+        observations = np.asarray(observations, dtype=np.float64)
+        gamma = np.asarray(gamma, dtype=np.float64)
+        xi = np.asarray(xi, dtype=np.float64)
+        if observations.ndim != 2 or observations.shape[1] != self.lpc_order:
+            raise ValueError(f"observations must have shape (n, {self.lpc_order})")
+        n_frames = len(observations)
+        slices = self._sequence_slices(n_frames, sequence_starts)
+        if gamma.shape != (n_frames, self.n_states):
+            raise ValueError("gamma must have shape (n_frames, n_states)")
+        expected_transitions = sum(max(end - start - 1, 0) for start, end in slices)
+        if xi.shape != (expected_transitions, self.n_states, self.n_states):
+            raise ValueError("xi shape does not match within-sequence transitions")
+        if not all(np.all(np.isfinite(arr)) for arr in (observations, gamma, xi)):
+            raise ValueError("observations and posteriors must contain only finite values")
+        if np.any(gamma < 0) or np.any(xi < 0):
+            raise ValueError("posterior probabilities must be non-negative")
 
-        xi_sum = np.sum(xi, axis=0)
-        gamma_sum = np.sum(gamma[:-1], axis=0)[:, None]
-        self.transition_matrix = xi_sum / (gamma_sum + 1e-12)
-        self.transition_matrix = np.clip(self.transition_matrix, 1e-9, None)
-        self.transition_matrix /= self.transition_matrix.sum(axis=1, keepdims=True)
+        initial_counts = gamma[np.asarray([start for start, _ in slices])].sum(axis=0) + 1e-6
+        new_initial = self._normalize_probabilities(initial_counts)
 
+        old_transition = self._normalize_probabilities(self.transition_matrix, axis=1)
+        transition_counts = xi.sum(axis=0)
+        transition_prior = self.transition_pseudocount * old_transition
+        transition_counts += transition_prior
+        transition_rows = transition_counts.sum(axis=1, keepdims=True)
+        new_transition = np.divide(
+            transition_counts,
+            transition_rows,
+            out=old_transition.copy(),
+            where=transition_rows > 0,
+        )
+        new_transition = np.clip(new_transition, 1e-12, None)
+        new_transition = self._normalize_probabilities(new_transition, axis=1)
+
+        # Each transition's source posterior is counted once; sequence-final frames
+        # cannot be sources because their next frame belongs to a separate recording.
+        source_mask = np.ones(n_frames, dtype=bool)
+        for _, end in slices:
+            source_mask[end - 1] = False
+        # Touching this statistic explicitly helps catch invalid transition posteriors
+        # before any parameters are modified.
+        if not np.all(np.isfinite(gamma[source_mask].sum(axis=0))):
+            raise FloatingPointError("transition occupancy contains non-finite values")
+        means = np.asarray(self.state_means, dtype=np.float64).copy()
+        covariances = np.asarray(self.state_covariances, dtype=np.float64).copy()
         for state in range(self.n_states):
             weights = gamma[:, state]
-            weight_sum = weights.sum()
-            if weight_sum <= 1e-9:
+            weight_sum = float(weights.sum())
+            if weight_sum <= 1e-10:
                 continue
+            mean = weights @ observations / weight_sum
+            centered = observations - mean
+            covariance = (centered * weights[:, None]).T @ centered / weight_sum
+            means[state] = mean
+            covariances[state] = self._regularize_covariance(covariance)
 
-            mean = np.dot(weights, observations) / weight_sum
-            diff = observations - mean
-            weighted_diff = diff * weights[:, None]
-            cov = np.dot(weighted_diff.T, diff) / weight_sum
-            cov += np.eye(self.lpc_order) * 1e-5
-            self.state_means[state] = mean
-            self.state_covariances[state] = cov
-
+        self.initial_probabilities = new_initial
+        self.transition_matrix = new_transition
+        self.state_means = means
+        self.state_covariances = covariances
         self._reset_caches()
-    
+
     def iterative_refinement(
         self,
         n_iterations=10,
@@ -1794,43 +2173,50 @@ class SpectralStateGuidedSynthesis:
         preview_every: int = 0,
         preview_duration_frames: int = 32,
         preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        tolerance: float = 1e-4,
+        patience: int = 2,
+        min_iterations: int = 1,
+        verbose: bool = True,
     ):
-        """
-        Phase 1, Step 3: Iterative Learning using EM Algorithm
-        
-        Args:
-            n_iterations: Number of EM iterations
-            preview_every: Generate a preview every N iterations (0 disables)
-            preview_duration_frames: Frame count for each preview render
-            preview_callback: Optional callable receiving preview metadata
-        """
-        if self.lpc_coefficients is None:
+        """Refine HMM parameters with finite checks and optional convergence stopping."""
+        if isinstance(n_iterations, (bool, np.bool_)) or not isinstance(n_iterations, (int, np.integer)) or n_iterations < 1:
+            raise ValueError("n_iterations must be a positive integer")
+        if isinstance(preview_every, (bool, np.bool_)) or not isinstance(preview_every, (int, np.integer)) or preview_every < 0:
+            raise ValueError("preview_every must be a non-negative integer")
+        if isinstance(preview_duration_frames, (bool, np.bool_)) or not isinstance(preview_duration_frames, (int, np.integer)) or preview_duration_frames <= 0:
+            raise ValueError("preview_duration_frames must be a positive integer")
+        if not np.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("tolerance must be finite and non-negative")
+        if isinstance(patience, (bool, np.bool_)) or not isinstance(patience, (int, np.integer)) or patience < 1:
+            raise ValueError("patience must be a positive integer")
+        if isinstance(min_iterations, (bool, np.bool_)) or not isinstance(min_iterations, (int, np.integer)) or not 1 <= min_iterations <= n_iterations:
+            raise ValueError("min_iterations must be between 1 and n_iterations")
+        if self.lpc_coefficients is None or self.transition_matrix is None:
             raise ValueError("Must initialize HMM parameters first")
-        
-        if preview_every < 0:
-            raise ValueError("preview_every must be >= 0")
-        if preview_duration_frames <= 0:
-            raise ValueError("preview_duration_frames must be > 0")
 
-        print(f"Starting EM training with {n_iterations} iterations...")
+        if verbose:
+            print(f"Starting EM training with at most {n_iterations} iterations...")
         self._caches.training_history.clear()
-        
         final_log_likelihood = 0.0
         final_entropy = 0.0
         final_smooth_penalty = 0.0
-        
-        for iteration in range(n_iterations):
-            gamma, xi, log_likelihood = self._expectation_step(self.lpc_coefficients)
+        previous_likelihood = None
+        stable_iterations = 0
+        starts = self._normalize_sequence_starts(len(self.lpc_coefficients))
 
-            occupancy = gamma.mean(axis=0)
-            occupancy = occupancy / (occupancy.sum() + 1e-12)
-            entropy = float(-np.sum(occupancy * np.log(occupancy + 1e-12)))
-
-            smooth_matrix = self._spectral_smoothness_matrix()
-            smooth_penalty = float(
-                np.sum(xi * smooth_matrix[None, :, :]) / (xi.shape[0] + 1e-12)
+        for iteration in range(int(n_iterations)):
+            gamma, xi, log_likelihood = self._expectation_step(
+                self.lpc_coefficients, sequence_starts=starts
             )
-
+            occupancy = gamma.mean(axis=0)
+            occupancy = occupancy / max(float(occupancy.sum()), 1e-12)
+            entropy = float(-np.sum(occupancy * np.log(occupancy + 1e-12)))
+            smooth_matrix = self._spectral_smoothness_matrix()
+            smooth_penalty = (
+                float(np.sum(xi * smooth_matrix[None, :, :]) / max(xi.shape[0], 1))
+                if xi.shape[0]
+                else 0.0
+            )
             history_entry = {
                 "iteration": iteration + 1,
                 "log_likelihood": float(log_likelihood),
@@ -1838,30 +2224,41 @@ class SpectralStateGuidedSynthesis:
                 "avg_smoothness_penalty": smooth_penalty,
             }
             self._caches.training_history.append(history_entry)
-
-            self._maximization_step(self.lpc_coefficients, gamma, xi)
-            print(
-                "Iteration {idx}: Log-likelihood = {ll:.2f} | Entropy = {ent:.3f} | "
-                "Smoothness = {smooth:.3f}".format(
-                    idx=iteration + 1,
-                    ll=log_likelihood,
-                    ent=entropy,
-                    smooth=smooth_penalty,
-                )
+            self._maximization_step(
+                self.lpc_coefficients, gamma, xi, sequence_starts=starts
             )
-            
-            # Store final iteration values for return
-            final_log_likelihood = log_likelihood
+
+            if verbose:
+                print(
+                    "Iteration {idx}: Log-likelihood = {ll:.2f} | Entropy = {ent:.3f} | "
+                    "Smoothness = {smooth:.3f}".format(
+                        idx=iteration + 1,
+                        ll=log_likelihood,
+                        ent=entropy,
+                        smooth=smooth_penalty,
+                    )
+                )
+            final_log_likelihood = float(log_likelihood)
             final_entropy = entropy
             final_smooth_penalty = smooth_penalty
 
-            preview_snapshot = None
-            if preview_every and ((iteration + 1) % preview_every == 0):
+            if previous_likelihood is not None and tolerance > 0:
+                relative_improvement = (log_likelihood - previous_likelihood) / max(
+                    1.0, abs(previous_likelihood)
+                )
+                if -tolerance <= relative_improvement <= tolerance:
+                    stable_iterations += 1
+                else:
+                    stable_iterations = 0
+            previous_likelihood = float(log_likelihood)
+
+            if preview_every and ((iteration + 1) % int(preview_every) == 0):
                 preview_frames = int(preview_duration_frames)
                 preview_sr_arg = int(self.sample_rate or 16000)
                 preview_audio, preview_sr = self.render_preview(
                     n_frames=preview_frames,
                     sample_rate=preview_sr_arg,
+                    seed=self.random_state + iteration,
                 )
                 preview_snapshot = self._record_preview_snapshot(
                     iteration=iteration + 1,
@@ -1870,10 +2267,8 @@ class SpectralStateGuidedSynthesis:
                     sample_rate=preview_sr,
                 )
                 history_entry["preview_index"] = len(self.preview_snapshots) - 1
-                message = (
-                    f"  Preview stored ({preview_frames} frames @ {preview_sr} Hz)"
-                )
-                print(message)
+                if verbose:
+                    print(f"  Preview stored ({preview_frames} frames @ {preview_sr} Hz)")
                 if preview_callback is not None:
                     try:
                         preview_callback(preview_snapshot)
@@ -1883,122 +2278,122 @@ class SpectralStateGuidedSynthesis:
                             RuntimeWarning,
                             stacklevel=2,
                         )
-        
-        return final_log_likelihood, final_entropy, final_smooth_penalty
-    
-    def run_em_iteration(self):
-        """
-        Run a single EM iteration and return metrics.
-        
-        This method is a convenience wrapper for external training loops.
-        It runs one complete EM iteration (E-step + M-step) on the current data.
-        
-        Returns:
-            Tuple of (log_likelihood, entropy, smooth_penalty)
-        """
-        if self.lpc_coefficients is None:
-            raise ValueError("Must initialize HMM parameters first")
-        
-        # E-step
-        gamma, xi, log_likelihood = self._expectation_step(self.lpc_coefficients)
-        
-        # Compute metrics
-        occupancy = gamma.mean(axis=0)
-        occupancy = occupancy / (occupancy.sum() + 1e-12)
-        entropy = float(-np.sum(occupancy * np.log(occupancy + 1e-12)))
-        
-        smooth_matrix = self._spectral_smoothness_matrix()
-        smooth_penalty = float(
-            np.sum(xi * smooth_matrix[None, :, :]) / (xi.shape[0] + 1e-12)
-        )
-        
-        # M-step
-        self._maximization_step(self.lpc_coefficients, gamma, xi)
-        
-        return log_likelihood, entropy, smooth_penalty
-    
-    def identify_graph_constraints(self, min_state_probability=1e-4):
-        """
-        Phase 1, Step 4: Graph Component Identification
-        
-        Identifies structural degeneracies in the HMM transition matrix,
-        marks isolated states, and redistributes their probability to
-        neighboring states within the same strongly connected component.
-        Note: this does not remove states (self.n_states is unchanged);
-        it only renormalizes transition probabilities.
-        
-        Args:
-            min_state_probability: Minimum stationary probability for a state to be kept
-        """
-        adjacency = (self.transition_matrix > 1e-6).astype(np.float64)
-        graph = csr_matrix(adjacency)
-        n_components, labels = _strong_components(graph)
-        
-        # Compute the stationary distribution via power iteration on the transition
-        # matrix. This is numerically robust and always returns a non-negative
-        # distribution, unlike ``np.linalg.eig`` whose (complex) left eigenvector can
-        # surface with an arbitrary sign and corrupt the pruning logic below.
-        stationary_dist = np.abs(self.initial_probabilities.copy())
-        stationary_dist /= stationary_dist.sum()
-        for _ in range(500):
-            stationary_next = self.transition_matrix.T @ stationary_dist
-            stationary_next = np.abs(stationary_next)
-            stationary_next /= stationary_next.sum()
-            if np.max(np.abs(stationary_next - stationary_dist)) < 1e-12:
-                stationary_dist = stationary_next
+            if stable_iterations >= patience and iteration + 1 >= min_iterations:
+                if verbose:
+                    print(f"Early stopping: relative likelihood improvement stayed within {tolerance:g}.")
                 break
-            stationary_dist = stationary_next
-        
-        # Identify states to remove (isolated or near-zero probability)
-        states_to_remove = set()
-        for state in range(self.n_states):
-            row = self.transition_matrix[state]
-            self_loop = row[state]
-            outgoing = row.sum() - self_loop
-            incoming = self.transition_matrix[:, state].sum() - self_loop
-            
-            # Mark states with very low stationary probability for removal
-            if stationary_dist[state] < min_state_probability:
-                states_to_remove.add(state)
-                continue
-            
-            # Renormalize rows with low outgoing/incoming probability
-            if outgoing < 1e-3 or incoming < 1e-3:
-                self_loop_prob = min(self_loop, 0.85)
-                remainder = 1.0 - self_loop_prob
-                if self.n_states > 1:
-                    row[:] = remainder / (self.n_states - 1)
-                    row[state] = 1.0 - remainder
-                else:
-                    row[state] = 1.0
-            row[:] = np.clip(row, 1e-6, None)
-            row /= row.sum()
-        
-        # Actually remove isolated states by redistributing their probability
-        if states_to_remove:
-            print(f"Identified {len(states_to_remove)} isolated states for removal")
-            for state in states_to_remove:
-                # Redistribute this state's probability to neighboring states
-                row = self.transition_matrix[state]
-                # Find states in the same strongly connected component
-                if n_components > 1:
-                    same_component_mask = labels == labels[state]
-                    # Redistribute uniformly within component
-                    component_size = np.sum(same_component_mask)
-                    if component_size > 1:
-                        row.fill(0.0)
-                        row[same_component_mask] = 1.0 / (component_size - 1)
-                        row[state] = 0.0  # Remove self-loop
-            
-            # Re-normalize all rows
-            row_sums = self.transition_matrix.sum(axis=1, keepdims=True)
-            row_sums = np.where(row_sums < 1e-12, 1.0, row_sums)
-            self.transition_matrix = self.transition_matrix / row_sums
 
+        return final_log_likelihood, final_entropy, final_smooth_penalty
+
+    def run_em_iteration(self):
+        """Run one complete E/M step and return likelihood, entropy, smoothness."""
+        if self.lpc_coefficients is None or self.transition_matrix is None:
+            raise ValueError("Must initialize HMM parameters first")
+        starts = self._normalize_sequence_starts(len(self.lpc_coefficients))
+        gamma, xi, log_likelihood = self._expectation_step(
+            self.lpc_coefficients, sequence_starts=starts
+        )
+        occupancy = gamma.mean(axis=0)
+        occupancy = occupancy / max(float(occupancy.sum()), 1e-12)
+        entropy = float(-np.sum(occupancy * np.log(occupancy + 1e-12)))
+        smooth_matrix = self._spectral_smoothness_matrix()
+        smooth_penalty = (
+            float(np.sum(xi * smooth_matrix[None, :, :]) / max(xi.shape[0], 1))
+            if xi.shape[0]
+            else 0.0
+        )
+        self._maximization_step(
+            self.lpc_coefficients, gamma, xi, sequence_starts=starts
+        )
+        self._caches.training_history.append({
+            "iteration": len(self._caches.training_history) + 1,
+            "log_likelihood": float(log_likelihood),
+            "occupancy_entropy": entropy,
+            "avg_smoothness_penalty": smooth_penalty,
+        })
+        return float(log_likelihood), entropy, smooth_penalty
+
+    def identify_graph_constraints(self, min_state_probability=1e-4):
+        """Rehome dormant states and guarantee a finite row-stochastic transition graph.
+
+        State dimensions are retained for checkpoint/API compatibility. Low-occupancy
+        states are made dormant: their outgoing transitions route to active states and
+        incoming probability is redistributed instead of silently deleting matrix mass.
+        """
+        if self.transition_matrix is None or self.initial_probabilities is None:
+            raise ValueError(_ERR_HMM_NOT_INITIALIZED)
+        if (
+            isinstance(min_state_probability, (bool, np.bool_))
+            or not isinstance(min_state_probability, (int, float, np.number))
+            or not np.isfinite(min_state_probability)
+            or not 0.0 <= min_state_probability <= 1.0
+        ):
+            raise ValueError("min_state_probability must be a number between 0.0 and 1.0")
+        transition = np.asarray(self.transition_matrix, dtype=np.float64)
+        if transition.shape != (self.n_states, self.n_states):
+            raise ValueError("transition_matrix shape does not match n_states")
+        if not np.all(np.isfinite(transition)) or np.any(transition < 0):
+            raise ValueError("transition_matrix must be finite and non-negative")
+        transition = self._normalize_probabilities(transition, axis=1)
+        stationary = self._normalize_probabilities(self.initial_probabilities)
+        # Damping makes power iteration converge for periodic (e.g. alternating) chains.
+        for _ in range(2000):
+            next_stationary = transition.T @ stationary
+            next_stationary = self._normalize_probabilities(next_stationary)
+            updated = 0.5 * stationary + 0.5 * next_stationary
+            if np.max(np.abs(updated - stationary)) < 1e-12:
+                stationary = updated
+                break
+            stationary = updated
+
+        active = stationary >= float(min_state_probability)
+        if not np.any(active):
+            active[int(np.argmax(stationary))] = True
+        active_distribution = stationary[active]
+        if active_distribution.sum() <= 0:
+            active_distribution = np.ones(np.count_nonzero(active), dtype=np.float64)
+        active_distribution = self._normalize_probabilities(active_distribution)
+
+        adjusted = transition.copy()
+        for state in range(self.n_states):
+            if not active[state]:
+                adjusted[state] = 0.0
+                adjusted[state, active] = active_distribution
+            else:
+                adjusted[state, ~active] = 0.0
+                row_sum = adjusted[state].sum()
+                if row_sum <= 0:
+                    adjusted[state, active] = active_distribution
+                else:
+                    adjusted[state] /= row_sum
+        # A tiny floor preserves reachability and prevents log(0) in decoders.
+        adjusted = np.clip(adjusted, 1e-12, None)
+        adjusted = self._normalize_probabilities(adjusted, axis=1)
+        initial = np.asarray(self.initial_probabilities, dtype=np.float64).copy()
+        dormant_mass = float(initial[~active].sum())
+        initial[~active] = 0.0
+        if np.any(active):
+            initial[active] += dormant_mass * active_distribution
+        initial = np.clip(initial, 1e-12, None)
+        initial = self._normalize_probabilities(initial)
+
+        graph = csr_matrix((adjusted > 1e-6).astype(np.float64))
+        n_components, _ = _strong_components(graph)
+        self.transition_matrix = adjusted
+        self.initial_probabilities = initial
         self._reset_caches()
         self._transition_cost_matrix()
-        print(f"Identified {n_components} strongly connected components")
-    
+        logger.info(
+            "Graph constraints retained %d active states and %d strongly connected components",
+            int(np.count_nonzero(active)),
+            int(n_components),
+        )
+        return {
+            "active_states": np.flatnonzero(active),
+            "stationary_distribution": stationary,
+            "n_components": int(n_components),
+        }
+
     def _spectral_smoothness_cost(self, state1, state2):
         """
         Compute spectral smoothness cost between two states
@@ -2013,11 +2408,9 @@ class SpectralStateGuidedSynthesis:
         return self._spectral_smoothness_matrix()[state1, state2]
 
     def _transition_cost_matrix(self):
-        if self.transition_matrix is None:
-            raise ValueError("Transition matrix is not initialized")
-
+        transition, _, _, _ = self._validated_model_parameters()
         if self._caches.transition_cost is None:
-            transition_cost = -np.log(self.transition_matrix + 1e-12)
+            transition_cost = -np.log(transition + 1e-12)
             smoothness = self._spectral_smoothness_matrix()
             psycho_weight = self._compute_psychoacoustic_weight()
             self._caches.transition_cost = (
@@ -2050,6 +2443,8 @@ class SpectralStateGuidedSynthesis:
         Returns:
             optimal_state_sequence: Most probable state sequence
         """
+        if isinstance(target_duration_frames, (bool, np.bool_)) or not isinstance(target_duration_frames, (int, np.integer)) or target_duration_frames <= 0:
+            raise ValueError("target_duration_frames must be a positive integer")
         # Use the compiled native decode when available (identical output to the
         # Python decoders, but ~170x faster on the synthesis hot path).
         if _NATIVE_BACKEND_AVAILABLE:
@@ -2218,9 +2613,10 @@ class SpectralStateGuidedSynthesis:
         return path
 
     def _state_spectral_prototypes(self, rng=None, seed=None):
+        """Build state LPC/residual prototypes; cache only data-derived results."""
         if self._caches.spectral_prototypes is not None:
             return self._caches.spectral_prototypes
-        if self.state_means is None:
+        if self.state_means is None or np.shape(self.state_means) != (self.n_states, self.lpc_order):
             raise ValueError("State means are not initialized")
 
         residuals = (
@@ -2229,80 +2625,64 @@ class SpectralStateGuidedSynthesis:
             else None
         )
         assignments = self._estimate_state_assignments()
-        rng = rng or np.random.default_rng(seed)
+        rng = rng if rng is not None else np.random.default_rng(seed)
         prototypes: List[Tuple[np.ndarray, np.ndarray]] = []
+        cacheable = residuals is not None and assignments is not None and len(residuals) == len(assignments)
+        global_residual = residuals.mean(axis=0) if residuals is not None else None
 
         for state in range(self.n_states):
-            if (
-                residuals is not None
-                and assignments is not None
-                and residuals.shape[0] == assignments.shape[0]
-            ):
+            if cacheable:
                 mask = assignments == state
-                if np.any(mask):
-                    residual_template = residuals[mask].mean(axis=0)
-                else:
-                    residual_template = rng.standard_normal(self.hop_size).astype(np.float32) * 0.05
+                # An unoccupied state uses the robust global residual template instead
+                # of injecting and then permanently caching seed-dependent random noise.
+                residual_template = residuals[mask].mean(axis=0) if np.any(mask) else global_residual.copy()
             else:
                 residual_template = rng.standard_normal(self.hop_size).astype(np.float32) * 0.05
-
-            residual_template = residual_template.astype(np.float32, copy=False)
-            if residual_template.shape[0] < self.hop_size:
+            residual_template = np.asarray(residual_template, dtype=np.float32).reshape(-1)
+            if residual_template.size < self.hop_size:
                 residual_template = np.pad(
                     residual_template,
-                    (0, self.hop_size - residual_template.shape[0]),
+                    (0, self.hop_size - residual_template.size),
                     mode="constant",
                 )
-            elif residual_template.shape[0] > self.hop_size:
+            elif residual_template.size > self.hop_size:
                 residual_template = residual_template[: self.hop_size]
+            prototypes.append((
+                np.asarray(self.state_means[state], dtype=np.float32).copy(),
+                residual_template.astype(np.float32, copy=False),
+            ))
 
-            prototypes.append(
-                (
-                    self.state_means[state].astype(np.float32, copy=False),
-                    residual_template,
-                )
-            )
-
-        self._caches.spectral_prototypes = prototypes
+        if cacheable:
+            self._caches.spectral_prototypes = prototypes
         return prototypes
-    
-    def _karplus_strong_excitation(self, state, duration_samples, rng=None):
-        """
-        Phase 2, Step 6: Excitation Generation using Delay-Line Feedback
-        
-        Args:
-            state: HMM state for parameterization
-            duration_samples: Number of samples to generate
-            
-        Returns:
-            excitation_signal: Karplus-Strong excitation signal
-        """
-        mean_coeffs = self.state_means[state]
-        spectral_centroid = np.mean(np.abs(mean_coeffs))
 
+    def _karplus_strong_excitation(self, state, duration_samples, rng=None):
+        """Generate a bounded, state-conditioned Karplus-Strong excitation block."""
+        if not isinstance(state, (int, np.integer)) or not 0 <= int(state) < self.n_states:
+            raise ValueError("state index is out of range")
+        if isinstance(duration_samples, (bool, np.bool_)) or not isinstance(duration_samples, (int, np.integer)) or duration_samples <= 0:
+            raise ValueError("duration_samples must be a positive integer")
+        mean_coeffs = np.asarray(self.state_means[state], dtype=np.float64)
+        spectral_centroid = float(np.mean(np.abs(mean_coeffs)))
         base_delay = int(20 + 80 * (1 - np.tanh(spectral_centroid)))
-        rng = rng or np.random.default_rng()
-        delay_line = max(2, base_delay + rng.integers(-5, 6))
+        rng = rng if rng is not None else self._rng
+        delay_line = max(2, base_delay + int(rng.integers(-5, 6)))
+        duration_samples = int(duration_samples)
 
         excitation = np.zeros(duration_samples, dtype=np.float32)
         noise_burst = rng.standard_normal(delay_line).astype(np.float32) * 0.5
-
-        damping = 0.98 - 0.1 * spectral_centroid
-        damping = float(np.clip(damping, 0.95, 0.99))
-
+        damping = float(np.clip(0.98 - 0.1 * spectral_centroid, 0.95, 0.99))
         if delay_line >= duration_samples:
-            excitation[:duration_samples] = noise_burst[:duration_samples]
+            excitation[:] = noise_burst[:duration_samples]
         else:
             excitation[:delay_line] = noise_burst
-            for i in range(delay_line, duration_samples):
-                excitation[i] = damping * 0.5 * (
-                    excitation[i - delay_line] + excitation[i - delay_line + 1]
+            for idx in range(delay_line, duration_samples):
+                excitation[idx] = damping * 0.5 * (
+                    excitation[idx - delay_line] + excitation[idx - delay_line + 1]
                 )
-
-        envelope = np.exp(-np.linspace(0, 5, duration_samples)).astype(np.float32)
-        excitation *= envelope
+        excitation *= np.exp(-np.linspace(0, 5, duration_samples)).astype(np.float32)
         return excitation
-    
+
     def _wavelet_excitation(self, state, duration_samples, rng=None):
         """
         Wavelet-based excitation generation as an alternative to Karplus-Strong.
@@ -2318,6 +2698,11 @@ class SpectralStateGuidedSynthesis:
         Returns:
             excitation_signal: Wavelet-based excitation signal
         """
+        if not isinstance(state, (int, np.integer)) or not 0 <= int(state) < self.n_states:
+            raise ValueError("state index is out of range")
+        if isinstance(duration_samples, (bool, np.bool_)) or not isinstance(duration_samples, (int, np.integer)) or duration_samples <= 0:
+            raise ValueError("duration_samples must be a positive integer")
+        duration_samples = int(duration_samples)
         try:
             import pywt
         except ImportError:
@@ -2348,7 +2733,7 @@ class SpectralStateGuidedSynthesis:
         
         # Generate wavelet coefficients from spectral state
         # Use LPC coefficients to modulate wavelet structure
-        rng = rng or np.random.default_rng()
+        rng = rng if rng is not None else self._rng
         
         # Create wavelet packet with state-dependent characteristics
         # Detail coefficients (high frequency) influenced by LPC magnitude
@@ -2402,86 +2787,80 @@ class SpectralStateGuidedSynthesis:
     
     @staticmethod
     def _stabilize_lpc(lpc_coeffs, max_k=0.995):
-        """
-        Ensure all poles of the all-pole filter 1 / A(z) lie strictly within the unit circle.
-        Uses Levinson recursion to convert direct-form coefficients to reflection coefficients
-        (PARCOR parameters), clamps |k_i| <= max_k < 1.0, and reconstructs the minimum-phase polynomial.
-        """
-        p = len(lpc_coeffs)
-        if p == 0:
-            return lpc_coeffs
-        a = np.concatenate([[1.0], lpc_coeffs]).astype(np.float64)
-        a_curr = a.copy()
-        k = np.zeros(p, dtype=np.float64)
-        for i in range(p, 0, -1):
-            ki = a_curr[i]
-            k[i - 1] = ki
-            denom = 1.0 - ki * ki
-            if abs(denom) < 1e-12:
-                denom = 1e-12 if denom >= 0 else -1e-12
-            a_prev = np.zeros(i, dtype=np.float64)
-            a_prev[0] = 1.0
-            for j in range(1, i):
-                a_prev[j] = (a_curr[j] - ki * a_curr[i - j]) / denom
-            a_curr = a_prev
-        
-        # Clamp reflection coefficients for strict minimum-phase stability
-        k_clamped = np.clip(k, -max_k, max_k)
-        
-        # Step-up recursion to reconstruct stable polynomial
-        a_stable = np.array([1.0], dtype=np.float64)
-        for i in range(p):
-            ki = k_clamped[i]
-            a_new = np.zeros(i + 2, dtype=np.float64)
-            a_new[0] = 1.0
-            for j in range(1, i + 1):
-                a_new[j] = a_stable[j] + ki * a_stable[i + 1 - j]
-            a_new[i + 1] = ki
-            a_stable = a_new
-            
-        return a_stable[1:].astype(lpc_coeffs.dtype)
+        """Clamp reflection coefficients and reconstruct a stable AR polynomial."""
+        original = np.asarray(lpc_coeffs)
+        if original.ndim != 1:
+            raise ValueError("lpc_coeffs must be 1-D")
+        if not np.isfinite(max_k) or not 0.0 < max_k < 1.0:
+            raise ValueError("max_k must be strictly between 0 and 1")
+        if original.size == 0:
+            return original.copy()
+        if not np.all(np.isfinite(original)):
+            return np.zeros_like(original)
+
+        order = original.size
+        direct = np.concatenate(([1.0], original.astype(np.float64, copy=False)))
+        current = direct.copy()
+        reflections = np.zeros(order, dtype=np.float64)
+        # Step-down Levinson recursion. Clamp before division so malformed or
+        # unstable input cannot create a negative prediction-error denominator.
+        for index in range(order, 0, -1):
+            reflection = float(np.clip(current[index], -max_k, max_k))
+            reflections[index - 1] = reflection
+            denominator = max(1.0 - reflection * reflection, 1.0 - max_k * max_k)
+            previous = np.zeros(index, dtype=np.float64)
+            previous[0] = 1.0
+            for coefficient in range(1, index):
+                previous[coefficient] = (
+                    current[coefficient] - reflection * current[index - coefficient]
+                ) / denominator
+            if not np.all(np.isfinite(previous)):
+                return np.zeros_like(original)
+            current = previous
+
+        stable = np.array([1.0], dtype=np.float64)
+        for index, reflection in enumerate(reflections):
+            updated = np.zeros(index + 2, dtype=np.float64)
+            updated[0] = 1.0
+            for coefficient in range(1, index + 1):
+                updated[coefficient] = (
+                    stable[coefficient] + reflection * stable[index + 1 - coefficient]
+                )
+            updated[index + 1] = reflection
+            stable = updated
+        result = stable[1:]
+        if not np.all(np.isfinite(result)):
+            return np.zeros_like(original)
+        return result.astype(original.dtype if original.dtype.kind == "f" else np.float64)
 
     def _lpc_synthesis_filter(self, excitation, lpc_coeffs, zi=None):
-        """
-        Phase 2, Step 7: Audio Synthesis using stabilized LPC filtering
-
-        Args:
-            excitation: Excitation signal
-            lpc_coeffs: LPC coefficients
-            zi: Initial filter state (for continuity between frames)
-
-        Returns:
-            Tuple of (synthesized_audio, new_zi) if zi was provided, else synthesized_audio
-        """
+        """Filter one excitation block, optionally preserving IIR state across hops."""
+        excitation = np.asarray(excitation, dtype=np.float64)
+        lpc_coeffs = np.asarray(lpc_coeffs, dtype=np.float64)
+        if excitation.ndim != 1 or not np.all(np.isfinite(excitation)):
+            raise ValueError("excitation must be a finite 1-D array")
+        if lpc_coeffs.ndim != 1 or not np.all(np.isfinite(lpc_coeffs)):
+            raise ValueError("lpc_coeffs must be a finite 1-D array")
         stable_coeffs = self._stabilize_lpc(lpc_coeffs)
-        filter_coeffs = np.concatenate([[1.0], stable_coeffs])
-        try:
-            if zi is not None:
-                synthesized, new_zi = signal.lfilter([1.0], filter_coeffs, excitation, zi=zi)
-            else:
-                synthesized = signal.lfilter([1.0], filter_coeffs, excitation)
-                new_zi = None
-            synthesized = np.nan_to_num(synthesized, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
-        except (ValueError, LinAlgError, RuntimeError) as e:
-            logger.warning(f"LPC filter failed ({type(e).__name__}: {e}), falling back to convolution")
-            # Fallback is mathematically incorrect but at least won't crash
-            # Note: This fallback does NOT support state carry
-            synthesized = np.convolve(excitation, filter_coeffs[::-1], mode="same").astype(np.float32)
-            synthesized = np.nan_to_num(synthesized, nan=0.0, posinf=1.0, neginf=-1.0)
-            new_zi = zi
-
-        max_val = np.max(np.abs(synthesized))
-        if max_val > 0.0 and zi is None:
-            # Standalone synthesis: normalize to a safe peak. When streaming with a
-            # carried ``zi`` we must NOT rescale per frame, otherwise each hop is
-            # independently gain-adjusted and the signal becomes discontinuous at
-            # frame boundaries (the carried filter state already preserves amplitude
-            # continuity). The global gain floor in ``synthesize_audio`` handles the
-            # overall level for streamed output.
-            synthesized = synthesized / max_val * 0.8
-
+        filter_coeffs = np.concatenate(([1.0], stable_coeffs.astype(np.float64)))
         if zi is not None:
-            return synthesized, new_zi
+            zi = np.asarray(zi, dtype=np.float64)
+            if zi.shape != (len(filter_coeffs) - 1,) or not np.all(np.isfinite(zi)):
+                raise ValueError(f"zi must be finite with shape ({len(filter_coeffs) - 1},)")
+            synthesized, new_zi = signal.lfilter([1.0], filter_coeffs, excitation, zi=zi)
+        else:
+            synthesized = signal.lfilter([1.0], filter_coeffs, excitation)
+            new_zi = None
+        synthesized = np.nan_to_num(synthesized, nan=0.0, posinf=1e6, neginf=-1e6)
+        synthesized = np.clip(synthesized, -1e6, 1e6).astype(np.float32)
+
+        # Only standalone blocks are scaled here. Continuous generation carries zi
+        # and receives a single global gain stage after all hops are joined.
+        peak = float(np.max(np.abs(synthesized))) if synthesized.size else 0.0
+        if peak > 0.0 and zi is None:
+            synthesized = synthesized / peak * 0.8
+        if zi is not None:
+            return synthesized, np.asarray(new_zi, dtype=np.float64)
         return synthesized
 
     def _apply_gain_floor(
@@ -2491,38 +2870,33 @@ class SpectralStateGuidedSynthesis:
         minimum_peak: float = 0.75,
         target_peak: float = 0.9,
     ) -> np.ndarray:
-        """
-        Normalize audio while ensuring a minimum peak level for audibility.
-        """
+        """Apply a bounded global gain stage; silence stays silent."""
+        for name, value in (("minimum_peak", minimum_peak), ("target_peak", target_peak)):
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, float, np.number))
+                or not np.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        if target_peak < minimum_peak:
+            raise ValueError("target_peak must be greater than or equal to minimum_peak")
         arr = np.asarray(audio, dtype=np.float32)
         if arr.size == 0:
             return arr
-
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
         peak = float(np.max(np.abs(arr)))
-        if peak <= 0.0:
+        if peak <= np.finfo(np.float32).tiny:
             return arr
-
-        floor = float(minimum_peak)
-        if floor <= 0.0:
-            raise ValueError("minimum_peak must be positive")
-
-        target = float(target_peak)
-        if target <= 0.0:
-            raise ValueError("target_peak must be positive")
-        if target < floor:
-            raise ValueError("target_peak must be greater than or equal to minimum_peak")
-
-        if peak <= floor:
-            target_level = floor
-        elif peak > target:
-            target_level = target
+        if peak <= minimum_peak:
+            target_level = float(minimum_peak)
+        elif peak > target_peak:
+            target_level = float(target_peak)
         else:
             return arr
+        return (arr * (target_level / peak)).astype(np.float32, copy=False)
 
-        scaled = arr * (target_level / peak)
-        return scaled.astype(np.float32, copy=False)
-
-    def _get_training_residual_for_state(self, state, rng=None):
+    def _get_training_residual_for_state(self, state, rng=None, n_samples=None):
         """
         Get a representative residual from training data for a given state.
 
@@ -2533,12 +2907,16 @@ class SpectralStateGuidedSynthesis:
         Returns:
             residual: Training residual signal for this state
         """
+        if not isinstance(state, (int, np.integer)) or not 0 <= int(state) < self.n_states:
+            raise ValueError("state index is out of range")
         if rng is None:
-            rng = np.random.default_rng()
+            rng = self._rng
+        target_length = self.hop_size if n_samples is None else int(n_samples)
+        if target_length <= 0:
+            raise ValueError("n_samples must be positive")
 
         if self.residual_signals is None or self.residual_signals.size == 0:
-            # No residuals available, return noise
-            return rng.standard_normal(self.hop_size).astype(np.float32) * 0.05
+            return rng.standard_normal(target_length).astype(np.float32) * 0.05
 
         assignments = self._estimate_state_assignments()
         if assignments is None:
@@ -2559,82 +2937,91 @@ class SpectralStateGuidedSynthesis:
                 residual = self.residual_signals[idx]
 
         # Ensure correct length
-        if residual.shape[0] < self.hop_size:
+        if residual.shape[0] < target_length:
             residual = np.pad(
                 residual,
-                (0, self.hop_size - residual.shape[0]),
+                (0, target_length - residual.shape[0]),
                 mode="constant",
             )
-        elif residual.shape[0] > self.hop_size:
-            residual = residual[: self.hop_size]
+        elif residual.shape[0] > target_length:
+            residual = residual[:target_length]
 
         return residual.astype(np.float32, copy=True)
 
     def render_preview(self, n_frames=32, sample_rate=None, state_sequence=None, rng=None, seed=None):
-        """Generate a lightweight audio preview using cached prototypes.
-
-        Returns a tuple ``(audio, sample_rate)`` for quick auditioning.
-        """
+        """Render a short, state-continuous preview without borrowing EM buffers."""
         if self.transition_matrix is None or self.initial_probabilities is None:
             raise ValueError("Model must be trained before rendering a preview")
-        if n_frames <= 0:
-            raise ValueError("n_frames must be positive")
-
-        sample_rate = int(sample_rate or (self.sample_rate or 16000))
-        prototypes = self._state_spectral_prototypes(rng=rng, seed=seed)
-
-        required_samples = n_frames * self.hop_size
-        workspace = self._caches.emission_workspace
-        min_cols = max(required_samples // max(self.lpc_order, 1) + 1, 1)
-        if workspace is None or workspace.size < required_samples:
-            workspace = np.empty((self.lpc_order, min_cols), dtype=np.float64)
-            self._caches.emission_workspace = workspace
-        elif workspace.shape[1] < min_cols:
-            workspace = np.empty((self.lpc_order, min_cols), dtype=np.float64)
-            self._caches.emission_workspace = workspace
-
-        preview_buffer = workspace.ravel()[:required_samples]
-        preview_buffer.fill(0.0)
-
-        if state_sequence is not None:
-            sequence = list(state_sequence[:n_frames])
-            if not sequence:
-                raise ValueError("state_sequence must contain at least one element")
-            if len(sequence) < n_frames:
-                sequence.extend([sequence[-1]] * (n_frames - len(sequence)))
+        if isinstance(n_frames, (bool, np.bool_)) or not isinstance(n_frames, (int, np.integer)) or n_frames <= 0:
+            raise ValueError("n_frames must be a positive integer")
+        if sample_rate is None:
+            output_rate = self._coerce_sample_rate(self.sample_rate or 16000)
         else:
-            rng = rng or np.random.default_rng(seed)
-            init_probs = self.initial_probabilities / self.initial_probabilities.sum()
-            current_state = int(rng.choice(self.n_states, p=init_probs))
-            sequence = [current_state]
-            for _ in range(1, n_frames):
-                probs = self.transition_matrix[current_state]
-                probs = probs / probs.sum()
-                current_state = int(rng.choice(self.n_states, p=probs))
-                sequence.append(current_state)
+            output_rate = self._coerce_sample_rate(sample_rate)
+        analysis_rate = self.sample_rate or output_rate
+        rng = rng if rng is not None else np.random.default_rng(seed)
+        if state_sequence is None:
+            sequence = self.sample_state_sequence(int(n_frames), rng=rng)
+        else:
+            sequence = self._validate_state_sequence(
+                state_sequence, int(n_frames), allow_pad=True
+            )
 
+        prototypes = self._state_spectral_prototypes(rng=rng, seed=seed)
+        required_samples = int(n_frames) * self.hop_size
+        preview = np.zeros(required_samples, dtype=np.float32)
+        filter_state = np.zeros(self.lpc_order, dtype=np.float64)
         for idx, state in enumerate(sequence):
             lpc_coeffs, residual_template = prototypes[state]
-            if residual_template.shape[0] < self.hop_size:
-                excitation = np.pad(
-                    residual_template,
-                    (0, self.hop_size - residual_template.shape[0]),
-                    mode="constant",
-                )
-            else:
-                excitation = residual_template[: self.hop_size]
-            frame_audio = self._lpc_synthesis_filter(excitation, lpc_coeffs)
+            excitation = np.asarray(residual_template[: self.hop_size], dtype=np.float32)
+            if excitation.size < self.hop_size:
+                excitation = np.pad(excitation, (0, self.hop_size - excitation.size))
+            frame_audio, filter_state = self._lpc_synthesis_filter(
+                excitation, lpc_coeffs, zi=filter_state
+            )
             start = idx * self.hop_size
-            end = start + self.hop_size
-            preview_buffer[start:end] += frame_audio[: self.hop_size]
+            preview[start : start + self.hop_size] = frame_audio[: self.hop_size]
 
-        if required_samples > 1:
-            preview_buffer[:required_samples] *= np.hanning(required_samples)
-
-        preview = np.tanh(preview_buffer[:required_samples])
+        # Fade only the outer edges; applying a Hann window to the whole preview
+        # used to attenuate every interior frame and create a large level dip.
+        fade = min(max(1, int(round(0.005 * analysis_rate))), required_samples // 2)
+        if fade > 1:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            preview[:fade] *= ramp
+            preview[-fade:] *= ramp[::-1]
+        if output_rate != analysis_rate:
+            divisor = math.gcd(output_rate, analysis_rate)
+            preview = signal.resample_poly(
+                preview, output_rate // divisor, analysis_rate // divisor
+            ).astype(np.float32, copy=False)
         preview = self._apply_gain_floor(preview, minimum_peak=0.75, target_peak=0.9)
-        return preview.astype(np.float32), sample_rate
-    
+        return preview.astype(np.float32, copy=False), output_rate
+
+    def _validate_state_sequence(self, state_sequence, target_frames, *, allow_pad=False):
+        if isinstance(target_frames, (bool, np.bool_)) or not isinstance(target_frames, (int, np.integer)) or target_frames <= 0:
+            raise ValueError("target_frames must be a positive integer")
+        try:
+            sequence = list(state_sequence)
+        except TypeError as exc:
+            raise ValueError("state_sequence must be an iterable of state indices") from exc
+        if not sequence:
+            raise ValueError("state_sequence must contain at least one state")
+        normalized = []
+        for state in sequence:
+            if isinstance(state, (bool, np.bool_)) or not isinstance(state, (int, np.integer)):
+                raise ValueError("state_sequence values must be integer state indices")
+            state = int(state)
+            if not 0 <= state < self.n_states:
+                raise ValueError(f"state_sequence contains out-of-range state {state}")
+            normalized.append(state)
+        if len(normalized) < target_frames:
+            if not allow_pad:
+                raise ValueError(
+                    f"state_sequence length ({len(normalized)}) < target_frames ({target_frames})"
+                )
+            normalized.extend([normalized[-1]] * (target_frames - len(normalized)))
+        return normalized[:target_frames]
+
     def sample_state_sequence(
         self,
         target_frames: int,
@@ -2642,38 +3029,27 @@ class SpectralStateGuidedSynthesis:
         rng=None,
         seed: Optional[int] = None,
     ):
-        """
-        Sample a dynamic state trajectory from the learned Markov transition matrix.
-        
-        Args:
-            target_frames: Number of frames to generate
-            temperature: Softmax sampling temperature (> 0.0). Higher values increase diversity.
-            rng: Optional NumPy random generator
-            seed: Optional random seed if rng is None
-            
-        Returns:
-            List of state indices of length target_frames
-        """
+        """Sample a finite Markov trajectory with a strictly positive temperature."""
         if self.transition_matrix is None or self.initial_probabilities is None:
             raise ValueError(_ERR_HMM_NOT_INITIALIZED)
-        rng = rng or np.random.default_rng(seed)
-        
-        init_p = np.clip(self.initial_probabilities, 1e-12, None).astype(np.float64)
-        if temperature > 0.0 and abs(temperature - 1.0) > 1e-6:
-            init_p = np.exp(np.log(init_p) / float(temperature))
-        init_p = init_p / init_p.sum()
-        
-        current_state = int(rng.choice(self.n_states, p=init_p))
-        path = [current_state]
-        
-        for _ in range(1, target_frames):
-            trans_p = np.clip(self.transition_matrix[current_state], 1e-12, None).astype(np.float64)
-            if temperature > 0.0 and abs(temperature - 1.0) > 1e-6:
-                trans_p = np.exp(np.log(trans_p) / float(temperature))
-            trans_p = trans_p / trans_p.sum()
-            current_state = int(rng.choice(self.n_states, p=trans_p))
-            path.append(current_state)
-            
+        if isinstance(target_frames, (bool, np.bool_)) or not isinstance(target_frames, (int, np.integer)) or target_frames <= 0:
+            raise ValueError("target_frames must be a positive integer")
+        if isinstance(temperature, (bool, np.bool_)) or not isinstance(temperature, (int, float, np.number)) or not np.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and greater than zero")
+        rng = rng if rng is not None else np.random.default_rng(seed)
+        transitions, initial, _, _ = self._validated_model_parameters()
+
+        def tempered(probabilities):
+            logits = np.log(np.clip(probabilities, np.finfo(np.float64).tiny, None)) / float(temperature)
+            logits -= np.max(logits)
+            weights = np.exp(logits)
+            return weights / weights.sum()
+
+        state = int(rng.choice(self.n_states, p=tempered(initial)))
+        path = [state]
+        for _ in range(1, int(target_frames)):
+            state = int(rng.choice(self.n_states, p=tempered(transitions[state])))
+            path.append(state)
         return path
 
     def synthesize_audio(
@@ -2681,124 +3057,195 @@ class SpectralStateGuidedSynthesis:
         target_duration_seconds,
         sample_rate=16000,
         fidelity=0.0,
-        excitation_type='Karplus-Strong',
+        excitation_type="Karplus-Strong",
         state_sequence=None,
-        method='viterbi',
+        method="viterbi",
         temperature=1.0,
         rng=None,
         seed=None,
     ):
-        """
-        Phase 2: Complete Audio Synthesis Pipeline
-
-        Args:
-            target_duration_seconds: Target duration in seconds
-            sample_rate: Output sample rate
-            fidelity: Reconstruction fidelity (0.0-1.0)
-                     0.0 = fully synthetic (uses excitation_type)
-                     1.0 = high fidelity reconstruction (training residuals)
-                     Values in between blend both approaches
-            excitation_type: Type of excitation for synthesis ('Karplus-Strong' or 'Wavelet')
-                           Only used when fidelity < 1.0
-            state_sequence: Optional precomputed state sequence
-            method: Sequence decoding method ('viterbi' or 'stochastic'/'markov')
-            temperature: Temperature for stochastic sequence sampling
-
-        Args:
-            rng: Optional NumPy random generator for deterministic excitation.
-            seed: Optional seed used if rng is not provided.
-
-        Returns:
-            audio_output: Generated audio signal
-        """
-        if self.transition_matrix is None:
+        """Generate exactly the requested duration, with rate-correct resampling."""
+        if self.transition_matrix is None or self.initial_probabilities is None:
             raise ValueError("Must train the model first using extract_features() and iterative_refinement()")
-
-        if not 0.0 <= fidelity <= 1.0:
-            raise ValueError("fidelity must be between 0.0 and 1.0")
-        
-        if excitation_type not in ['Karplus-Strong', 'Wavelet']:
+        if isinstance(target_duration_seconds, (bool, np.bool_)) or not isinstance(target_duration_seconds, (int, float, np.number)) or not np.isfinite(target_duration_seconds) or target_duration_seconds <= 0:
+            raise ValueError("target_duration_seconds must be finite and greater than zero")
+        output_rate = self._coerce_sample_rate(sample_rate)
+        if isinstance(fidelity, (bool, np.bool_)) or not isinstance(fidelity, (int, float, np.number)) or not np.isfinite(fidelity) or not 0.0 <= fidelity <= 1.0:
+            raise ValueError("fidelity must be a finite number between 0.0 and 1.0")
+        if isinstance(temperature, (bool, np.bool_)) or not isinstance(temperature, (int, float, np.number)) or not np.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and greater than zero")
+        excitation_map = {
+            "karplus-strong": "Karplus-Strong",
+            "wavelet": "Wavelet",
+        }
+        if not isinstance(excitation_type, str) or excitation_type.casefold() not in excitation_map:
             raise ValueError("excitation_type must be 'Karplus-Strong' or 'Wavelet'")
+        excitation_type = excitation_map[excitation_type.casefold()]
+        method_aliases = {"viterbi": "viterbi", "stochastic": "stochastic", "markov": "stochastic", "sample": "stochastic"}
+        if not isinstance(method, str) or method.casefold() not in method_aliases:
+            raise ValueError("method must be 'viterbi' or 'stochastic'/'markov'")
+        method = method_aliases[method.casefold()]
 
-        target_frames = int(target_duration_seconds * sample_rate / self.hop_size)
-        print(f"Synthesizing {target_duration_seconds}s of audio ({target_frames} frames)")
-        print(f"Fidelity: {fidelity:.2f} (0.0=synthetic, 1.0=reconstruction)")
-        if fidelity < 1.0:
-            print(f"Excitation type: {excitation_type}")
+        _, _, state_means, state_covariances = self._validated_model_parameters()
 
-        rng = rng or np.random.default_rng(seed)
+        analysis_rate = self.sample_rate or output_rate
+        target_output_samples = int(round(float(target_duration_seconds) * output_rate))
+        target_analysis_samples = int(round(float(target_duration_seconds) * analysis_rate))
+        if target_output_samples <= 0 or target_analysis_samples <= 0:
+            raise ValueError("requested duration is shorter than one output sample")
+        target_frames = max(1, int(math.ceil(target_analysis_samples / self.hop_size)))
+        rng = rng if rng is not None else np.random.default_rng(seed)
 
-        # Step 5: Decode or sample state sequence
         if state_sequence is not None:
-            if len(state_sequence) < target_frames:
-                raise ValueError(f"Provided state_sequence length ({len(state_sequence)}) < target_frames ({target_frames})")
-            state_sequence = list(state_sequence[:target_frames])
-        elif method in ('stochastic', 'markov', 'sample'):
-            print("Step 5: Sampling state sequence from Markov transition matrix...")
-            state_sequence = self.sample_state_sequence(target_frames, temperature=temperature, rng=rng)
+            sequence = self._validate_state_sequence(state_sequence, target_frames)
+        elif method == "stochastic":
+            sequence = self.sample_state_sequence(
+                target_frames, temperature=temperature, rng=rng
+            )
         else:
-            print("Step 5: Decoding state sequence with smoothness-aware dynamic programming...")
-            state_sequence = self._a_star_search(target_frames)
+            sequence = self._a_star_search(target_frames)
 
-        audio_output = np.zeros(target_frames * self.hop_size, dtype=np.float32)
-
-        print("Step 6-8: Generating excitation, synthesizing audio...")
-        
-        # Initialize filter state for continuity between frames. Each frame is
-        # synthesized as a contiguous hop_size-length chunk and the carried filter
-        # state preserves amplitude continuity across boundaries, so frames are
-        # simply concatenated. Per-frame windowing is intentionally avoided: a
-        # rising window would force every frame to start at zero and break the
-        # continuity that zi provides.
-        filter_order = self.lpc_order + 1  # Includes the leading 1.0
-        zi = np.zeros(filter_order - 1, dtype=np.float64)  # lfilter needs len(b)+len(a)-2 = lpc_order states
-
-        for idx, state in enumerate(state_sequence):
+        audio = np.zeros(target_frames * self.hop_size, dtype=np.float32)
+        filter_state = np.zeros(self.lpc_order, dtype=np.float64)
+        for idx, state in enumerate(sequence):
             if fidelity >= 1.0:
-                # Pure reconstruction mode: use training residuals only
-                excitation = self._get_training_residual_for_state(state, rng)
+                excitation = self._get_training_residual_for_state(
+                    state, rng=rng, n_samples=self.hop_size
+                )
             elif fidelity <= 0.0:
-                # Pure synthetic mode: use selected excitation type
-                if excitation_type == 'Karplus-Strong':
-                    excitation = self._karplus_strong_excitation(
-                        state,
-                        self.hop_size,
-                        rng=rng,
-                    )
-                else:  # Wavelet
-                    excitation = self._wavelet_excitation(
-                        state,
-                        self.hop_size,
-                        rng=rng,
-                    )
+                if excitation_type == "Karplus-Strong":
+                    excitation = self._karplus_strong_excitation(state, self.hop_size, rng=rng)
+                else:
+                    excitation = self._wavelet_excitation(state, self.hop_size, rng=rng)
             else:
-                # Blend mode: mix both approaches
-                residual_excitation = self._get_training_residual_for_state(state, rng)
-                if excitation_type == 'Karplus-Strong':
-                    synthetic_excitation = self._karplus_strong_excitation(
-                        state,
-                        self.hop_size,
-                        rng=rng,
-                    )
-                else:  # Wavelet
-                    synthetic_excitation = self._wavelet_excitation(
-                        state,
-                        self.hop_size,
-                        rng=rng,
-                    )
-                # Linear blend based on fidelity parameter
-                excitation = (fidelity * residual_excitation +
-                            (1.0 - fidelity) * synthetic_excitation)
+                residual = self._get_training_residual_for_state(
+                    state, rng=rng, n_samples=self.hop_size
+                )
+                if excitation_type == "Karplus-Strong":
+                    synthetic = self._karplus_strong_excitation(state, self.hop_size, rng=rng)
+                else:
+                    synthetic = self._wavelet_excitation(state, self.hop_size, rng=rng)
+                excitation = fidelity * residual + (1.0 - fidelity) * synthetic
 
-            frame_audio, zi = self._lpc_synthesis_filter(excitation, self.state_means[state], zi=zi)
-
+            frame_audio, filter_state = self._lpc_synthesis_filter(
+                excitation, state_means[state], zi=filter_state
+            )
             start = idx * self.hop_size
-            end = start + self.hop_size
-            audio_output[start:end] += frame_audio[:self.hop_size]
+            audio[start : start + self.hop_size] = frame_audio[: self.hop_size]
 
-        audio_output = self._apply_gain_floor(audio_output, minimum_peak=0.75, target_peak=0.9)
-        return audio_output.astype(np.float32)
-    
+        # Synthesize at the trained analysis rate so frame timing and LPC pole
+        # frequencies stay coherent, then convert to the caller's requested rate.
+        audio = audio[:target_analysis_samples]
+        if output_rate != analysis_rate:
+            divisor = math.gcd(output_rate, analysis_rate)
+            audio = signal.resample_poly(
+                audio, output_rate // divisor, analysis_rate // divisor
+            ).astype(np.float32, copy=False)
+        if len(audio) < target_output_samples:
+            audio = np.pad(audio, (0, target_output_samples - len(audio)))
+        else:
+            audio = audio[:target_output_samples]
+        audio = self._apply_gain_floor(audio, minimum_peak=0.75, target_peak=0.9)
+        return np.asarray(audio, dtype=np.float32)
+
+    @staticmethod
+    def _atomic_write(filepath, writer):
+        """Write an artifact beside its destination and atomically replace it."""
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{filepath.name}.", suffix=filepath.suffix, dir=str(filepath.parent)
+        )
+        os.close(fd)
+        try:
+            writer(Path(temp_name))
+            os.replace(temp_name, filepath)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    def _restore_model_parameters(self, transition, initial, means, covariances):
+        """Validate, normalize and regularize parameters loaded from an artifact."""
+        transition = np.asarray(transition, dtype=np.float64)
+        initial = np.asarray(initial, dtype=np.float64)
+        means = np.asarray(means, dtype=np.float64)
+        covariances = np.asarray(covariances, dtype=np.float64)
+        expected_cov_shape = (self.n_states, self.lpc_order, self.lpc_order)
+        if transition.shape != (self.n_states, self.n_states):
+            raise ValueError("transition_matrix shape does not match model metadata")
+        if initial.shape != (self.n_states,):
+            raise ValueError("initial_probabilities shape does not match model metadata")
+        if means.shape != (self.n_states, self.lpc_order):
+            raise ValueError("state_means shape does not match model metadata")
+        if covariances.shape != expected_cov_shape:
+            raise ValueError("state_covariances shape does not match model metadata")
+        if not all(np.all(np.isfinite(array)) for array in (transition, initial, means, covariances)):
+            raise ValueError("model artifact contains NaN or infinite parameters")
+        if np.any(transition < 0) or np.any(initial < 0):
+            raise ValueError("model probabilities must be non-negative")
+        if np.any(transition.sum(axis=1) <= 0) or initial.sum() <= 0:
+            raise ValueError("model probabilities must have positive mass")
+        transition = self._normalize_probabilities(transition, axis=1)
+        initial = self._normalize_probabilities(initial)
+
+        repaired_covariances = np.empty_like(covariances)
+        for state in range(self.n_states):
+            cov = 0.5 * (covariances[state] + covariances[state].T)
+            eigenvalues = np.linalg.eigvalsh(cov)
+            minimum = float(eigenvalues.min())
+            if minimum < self.COVARIANCE_MIN_EIGENVALUE:
+                cov += np.eye(self.lpc_order) * (
+                    self.COVARIANCE_MIN_EIGENVALUE - minimum
+                )
+            repaired_covariances[state] = 0.5 * (cov + cov.T)
+        self.transition_matrix = transition
+        self.initial_probabilities = initial
+        self.state_means = means
+        self.state_covariances = repaired_covariances
+
+    def _validate_training_artifacts(self):
+        """Check optional cached arrays remain aligned after loading or adaptation."""
+        count = None
+        if self.lpc_coefficients is not None:
+            lpc = np.asarray(self.lpc_coefficients)
+            if lpc.ndim != 2 or lpc.shape[1] != self.lpc_order or not np.all(np.isfinite(lpc)):
+                raise ValueError("lpc_coefficients artifact has an invalid shape or values")
+            count = len(lpc)
+        if self.training_frames is not None:
+            frames = np.asarray(self.training_frames)
+            if frames.ndim != 2 or frames.shape[1] != self.frame_size or not np.all(np.isfinite(frames)):
+                raise ValueError("training_frames artifact has an invalid shape or values")
+            if count is not None and len(frames) != count:
+                raise ValueError("training_frames and lpc_coefficients lengths differ")
+            count = len(frames) if count is None else count
+        if count is None:
+            if self.sequence_starts is not None:
+                raise ValueError("sequence_starts cannot be loaded without training artifacts")
+            return
+        for name, array in (
+            ("residual_signals", self.residual_signals),
+            ("perceptual_features", self.perceptual_features),
+            ("spectral_flux", self.spectral_flux),
+        ):
+            if array is not None and (np.asarray(array).ndim == 0 or len(array) != count or not np.all(np.isfinite(array))):
+                raise ValueError(f"{name} artifact has inconsistent length or non-finite values")
+        if self.residual_signals is not None and (
+            np.asarray(self.residual_signals).ndim != 2
+            or np.asarray(self.residual_signals).shape[1] != self.hop_size
+        ):
+            raise ValueError("residual_signals artifact must have shape (n, hop_size)")
+        if self.perceptual_features is not None and np.asarray(self.perceptual_features).ndim != 2:
+            raise ValueError("perceptual_features artifact must be 2-D")
+        if self.spectral_flux is not None and np.asarray(self.spectral_flux).ndim != 1:
+            raise ValueError("spectral_flux artifact must be 1-D")
+        if self.frame_metadata:
+            for key, values in self.frame_metadata.items():
+                values = np.asarray(values)
+                if values.ndim != 1 or len(values) != count or not np.all(np.isfinite(values)):
+                    raise ValueError(f"frame metadata '{key}' has inconsistent shape or non-finite values")
+        starts = self._normalize_sequence_starts(count, self.sequence_starts)
+        self._artifacts.sequence_starts = starts
+
     def export_model(
         self,
         filepath,
@@ -2809,175 +3256,175 @@ class SpectralStateGuidedSynthesis:
         include_training_artifacts=False,
         include_adaptive_statistics=True,
     ):
-        """Serialize trained model parameters to disk with optional compression."""
-        if self.transition_matrix is None:
-            raise ValueError("Model must be trained before exporting")
-
+        """Atomically export parameters and optional aligned training artifacts."""
+        transition, initial, means, covariances = self._validated_model_parameters()
+        self._compute_and_cache_cholesky_factors()
         target_dtype = np.dtype(precision)
         if target_dtype.kind != "f":
             raise ValueError("precision must be a floating-point dtype")
-
         filepath = Path(filepath)
         if filepath.suffix != ".npz":
             filepath = filepath.with_suffix(".npz")
 
         metadata = {
-            "version": 1,
+            "version": 2,
             "n_states": int(self.n_states),
             "lpc_order": int(self.lpc_order),
             "frame_size": int(self.frame_size),
             "hop_size": int(self.hop_size),
             "smoothness_weight": float(self.smoothness_weight),
+            "covariance_floor": float(self.covariance_floor),
+            "transition_pseudocount": float(self.transition_pseudocount),
+            "random_state": int(self.random_state),
             "pack_covariances": bool(pack_covariances),
             "precision": target_dtype.name,
             "includes_training_artifacts": bool(include_training_artifacts),
             "includes_adaptive_statistics": bool(include_adaptive_statistics),
             "sample_rate": int(self.sample_rate) if self.sample_rate is not None else None,
             "adaptive_memory_limit": int(self.adaptive_memory_limit),
+            "augmentation_applied": bool(self.augmentation_applied),
         }
-
         payload = {
-            "transition_matrix": self.transition_matrix.astype(target_dtype, copy=False),
-            "initial_probabilities": self.initial_probabilities.astype(target_dtype, copy=False),
-            "state_means": self.state_means.astype(target_dtype, copy=False),
+            "transition_matrix": transition.astype(target_dtype, copy=False),
+            "initial_probabilities": initial.astype(target_dtype, copy=False),
+            "state_means": means.astype(target_dtype, copy=False),
         }
-
         if pack_covariances:
             tri_rows, tri_cols = np.tril_indices(self.lpc_order)
-            packed = self.state_covariances[:, tri_rows, tri_cols]
-            payload["state_covariances_packed"] = packed.astype(target_dtype, copy=False)
+            payload["state_covariances_packed"] = covariances[:, tri_rows, tri_cols].astype(target_dtype, copy=False)
         else:
-            payload["state_covariances"] = self.state_covariances.astype(target_dtype, copy=False)
+            payload["state_covariances"] = covariances.astype(target_dtype, copy=False)
 
-        if include_training_artifacts and self.training_frames is not None:
-            payload["training_frames"] = self.training_frames.astype(target_dtype, copy=False)
-            if self.lpc_coefficients is not None:
-                payload["lpc_coefficients"] = self.lpc_coefficients.astype(target_dtype, copy=False)
-            if self.residual_signals is not None:
-                payload["residual_signals"] = self.residual_signals.astype(target_dtype, copy=False)
-            if self.perceptual_features is not None:
-                payload["perceptual_features"] = self.perceptual_features.astype(
-                    target_dtype,
-                    copy=False,
-                )
-            if self.spectral_flux is not None:
-                payload["spectral_flux"] = self.spectral_flux.astype(target_dtype, copy=False)
+        if include_training_artifacts:
+            for key, value in (
+                ("training_frames", self.training_frames),
+                ("lpc_coefficients", self.lpc_coefficients),
+                ("residual_signals", self.residual_signals),
+                ("perceptual_features", self.perceptual_features),
+                ("spectral_flux", self.spectral_flux),
+            ):
+                if value is not None:
+                    payload[key] = np.asarray(value).astype(target_dtype, copy=False)
+            if self.sequence_starts is not None:
+                payload["sequence_starts"] = np.asarray(self.sequence_starts, dtype=np.int64)
             if self.frame_metadata:
                 metadata["frame_metadata_keys"] = list(self.frame_metadata.keys())
                 for key, values in self.frame_metadata.items():
                     arr = np.asarray(values)
-                    if arr.dtype.kind == "f":
-                        arr = arr.astype(target_dtype, copy=False)
-                    payload[f"frame_metadata__{key}"] = arr
+                    payload[f"frame_metadata__{key}"] = arr.astype(target_dtype, copy=False) if arr.dtype.kind == "f" else arr
 
         if include_adaptive_statistics and self._adaptive_stats is not None:
             stats = self._adaptive_stats
-            payload["adaptive_state_frame_counts"] = stats.state_frame_counts.astype(
-                target_dtype, copy=False
-            )
-            payload["adaptive_transition_counts"] = stats.transition_counts.astype(
-                target_dtype, copy=False
-            )
-            payload["adaptive_mean_accumulator"] = stats.mean_accumulator.astype(
-                target_dtype, copy=False
-            )
-            payload["adaptive_second_moment"] = stats.second_moment_accumulator.astype(
-                target_dtype, copy=False
-            )
-            payload["adaptive_initial_counts"] = stats.initial_counts.astype(
-                target_dtype, copy=False
-            )
-            payload["adaptive_total_frames"] = np.array(stats.total_frames, dtype=target_dtype)
-            payload["adaptive_last_adaptation"] = np.array(
-                stats.last_adaptation or "", dtype=np.str_
-            )
-
+            payload.update({
+                "adaptive_state_frame_counts": stats.state_frame_counts.astype(target_dtype, copy=False),
+                "adaptive_transition_counts": stats.transition_counts.astype(target_dtype, copy=False),
+                "adaptive_mean_accumulator": stats.mean_accumulator.astype(target_dtype, copy=False),
+                "adaptive_second_moment": stats.second_moment_accumulator.astype(target_dtype, copy=False),
+                "adaptive_initial_counts": stats.initial_counts.astype(target_dtype, copy=False),
+                "adaptive_total_frames": np.array(stats.total_frames, dtype=target_dtype),
+                "adaptive_last_adaptation": np.array(stats.last_adaptation or "", dtype=np.str_),
+            })
         payload["metadata"] = np.array(json.dumps(metadata), dtype=np.str_)
-
         saver = np.savez_compressed if use_compression else np.savez
-        saver(filepath, **payload)
+        self._atomic_write(filepath, lambda temporary: saver(temporary, **payload))
+        logger.info("Model exported to %s", filepath)
 
     @classmethod
     def load_model(cls, filepath):
-        """Load a serialized model produced by ``export_model``."""
+        """Load and validate an SSGS ``.npz`` artifact (including v1 archives)."""
         filepath = Path(filepath)
-        with np.load(filepath, allow_pickle=False) as data:
-            metadata = json.loads(data["metadata"].item())  # pylint: disable=no-member
-
-            model = cls(
-                n_states=metadata["n_states"],
-                lpc_order=metadata["lpc_order"],
-                frame_size=metadata["frame_size"],
-                hop_size=metadata["hop_size"],
-                smoothness_weight=metadata.get("smoothness_weight", 0.5),
-                adaptive_memory_limit=metadata.get("adaptive_memory_limit", 6000),
-            )
-
-            transition = data["transition_matrix"].astype(np.float64, copy=False)  # pylint: disable=no-member
-            transition = np.clip(transition, 1e-12, None)
-            transition /= transition.sum(axis=1, keepdims=True)
-            model.transition_matrix = transition
-
-            init_probs = data["initial_probabilities"].astype(np.float64, copy=False)  # pylint: disable=no-member
-            init_probs = np.clip(init_probs, 1e-12, None)
-            model.initial_probabilities = init_probs / init_probs.sum()
-            model.state_means = data["state_means"].astype(np.float64, copy=False)  # pylint: disable=no-member
+        if not filepath.exists():
+            raise FileNotFoundError(f"Model file not found: {filepath}")
+        try:
+            archive = np.load(filepath, allow_pickle=False)
+        except Exception as exc:
+            raise ValueError(f"Could not open model archive: {exc}") from exc
+        with archive as data:
+            if "metadata" not in data:
+                raise ValueError("Model archive is missing metadata")
+            try:
+                metadata = json.loads(data["metadata"].item())
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Model archive metadata is invalid JSON") from exc
+            version = int(metadata.get("version", 1))
+            if version not in (1, 2):
+                raise ValueError(f"Unsupported model archive version: {version}")
+            try:
+                model = cls(
+                    n_states=int(metadata["n_states"]),
+                    lpc_order=int(metadata["lpc_order"]),
+                    frame_size=int(metadata["frame_size"]),
+                    hop_size=int(metadata["hop_size"]),
+                    smoothness_weight=float(metadata.get("smoothness_weight", 0.5)),
+                    adaptive_memory_limit=int(metadata.get("adaptive_memory_limit", 6000)),
+                    random_state=int(metadata.get("random_state", 0)),
+                    covariance_floor=float(metadata.get("covariance_floor", 1e-4)),
+                    transition_pseudocount=float(metadata.get("transition_pseudocount", 1e-6)),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Model archive configuration is invalid: {exc}") from exc
 
             if metadata.get("pack_covariances", False):
-                tri_rows, tri_cols = np.tril_indices(model.lpc_order)
-                packed = data["state_covariances_packed"].astype(np.float64, copy=False)  # pylint: disable=no-member
-                full_cov = np.zeros(
-                    (model.n_states, model.lpc_order, model.lpc_order),
-                    dtype=np.float64,
-                )
-                full_cov[:, tri_rows, tri_cols] = packed
-                full_cov[:, tri_cols, tri_rows] = packed
-                model.state_covariances = full_cov
+                if "state_covariances_packed" not in data:
+                    raise ValueError("Model archive is missing packed covariances")
+                packed = np.asarray(data["state_covariances_packed"], dtype=np.float64)
+                expected = model.lpc_order * (model.lpc_order + 1) // 2
+                if packed.shape != (model.n_states, expected):
+                    raise ValueError("Packed covariance tensor has invalid shape")
+                rows, cols = np.tril_indices(model.lpc_order)
+                covariances = np.zeros((model.n_states, model.lpc_order, model.lpc_order), dtype=np.float64)
+                covariances[:, rows, cols] = packed
+                covariances[:, cols, rows] = packed
+            elif "state_covariances" in data:
+                covariances = np.asarray(data["state_covariances"], dtype=np.float64)
             else:
-                model.state_covariances = data["state_covariances"].astype(np.float64, copy=False)  # pylint: disable=no-member
+                raise ValueError("Model archive is missing state covariances")
+            required = ("transition_matrix", "initial_probabilities", "state_means")
+            missing = [key for key in required if key not in data]
+            if missing:
+                raise ValueError("Model archive missing required arrays: " + ", ".join(missing))
+            model._restore_model_parameters(
+                data["transition_matrix"], data["initial_probabilities"],
+                data["state_means"], covariances,
+            )
 
-            if "training_frames" in data:
-                model.training_frames = data["training_frames"].astype(np.float32, copy=False)  # pylint: disable=no-member
-            if "lpc_coefficients" in data:
-                model.lpc_coefficients = data["lpc_coefficients"].astype(np.float32, copy=False)  # pylint: disable=no-member
-            if "residual_signals" in data:
-                model.residual_signals = data["residual_signals"].astype(np.float32, copy=False)  # pylint: disable=no-member
-            if "perceptual_features" in data:
-                model.perceptual_features = data["perceptual_features"].astype(np.float32, copy=False)  # pylint: disable=no-member
-            if "spectral_flux" in data:
-                model.spectral_flux = data["spectral_flux"].astype(np.float32, copy=False)  # pylint: disable=no-member
-
+            for key in ("training_frames", "lpc_coefficients", "residual_signals", "perceptual_features", "spectral_flux"):
+                if key in data:
+                    setattr(model, key, data[key].astype(np.float32, copy=False))
+            if "sequence_starts" in data:
+                model.sequence_starts = data["sequence_starts"]
+            elif model.lpc_coefficients is not None or model.training_frames is not None:
+                model.sequence_starts = np.array([0], dtype=np.int64)
             meta_keys = metadata.get("frame_metadata_keys", [])
             if meta_keys:
-                frame_meta: Dict[str, np.ndarray] = {}
+                frame_meta = {}
                 for key in meta_keys:
-                    frame_meta[key] = data[f"frame_metadata__{key}"].copy()  # pylint: disable=no-member
+                    tensor_key = f"frame_metadata__{key}"
+                    if tensor_key not in data:
+                        raise ValueError(f"Model archive is missing frame metadata '{key}'")
+                    frame_meta[key] = data[tensor_key].copy()
                 model.frame_metadata = frame_meta
-            else:
-                model.frame_metadata = {}
-
             model.sample_rate = metadata.get("sample_rate")
+            model.augmentation_applied = bool(metadata.get("augmentation_applied", False))
 
             if metadata.get("includes_adaptive_statistics") and "adaptive_state_frame_counts" in data:
-                model._adaptive_stats = _AdaptiveStatistics(
-                    state_frame_counts=data["adaptive_state_frame_counts"].astype(  # pylint: disable=no-member
-                        np.float64, copy=False
-                    ),
-                    transition_counts=data["adaptive_transition_counts"].astype(  # pylint: disable=no-member
-                        np.float64, copy=False
-                    ),
-                    mean_accumulator=data["adaptive_mean_accumulator"].astype(  # pylint: disable=no-member
-                        np.float64, copy=False
-                    ),
-                    second_moment_accumulator=data["adaptive_second_moment"].astype(  # pylint: disable=no-member
-                        np.float64, copy=False
-                    ),
-                    initial_counts=data["adaptive_initial_counts"].astype(  # pylint: disable=no-member
-                        np.float64, copy=False
-                    ),
-                    total_frames=float(data["adaptive_total_frames"].item()),  # pylint: disable=no-member
-                    last_adaptation=data["adaptive_last_adaptation"].item() or None,  # pylint: disable=no-member
+                required_stats = (
+                    "adaptive_transition_counts", "adaptive_mean_accumulator",
+                    "adaptive_second_moment", "adaptive_initial_counts", "adaptive_total_frames",
                 )
+                missing_stats = [key for key in required_stats if key not in data]
+                if missing_stats:
+                    raise ValueError("Adaptive statistics incomplete: " + ", ".join(missing_stats))
+                model._adaptive_stats = _AdaptiveStatistics(
+                    state_frame_counts=np.asarray(data["adaptive_state_frame_counts"], dtype=np.float64),
+                    transition_counts=np.asarray(data["adaptive_transition_counts"], dtype=np.float64),
+                    mean_accumulator=np.asarray(data["adaptive_mean_accumulator"], dtype=np.float64),
+                    second_moment_accumulator=np.asarray(data["adaptive_second_moment"], dtype=np.float64),
+                    initial_counts=np.asarray(data["adaptive_initial_counts"], dtype=np.float64),
+                    total_frames=float(data["adaptive_total_frames"].item()),
+                    last_adaptation=str(data["adaptive_last_adaptation"].item() or "") if "adaptive_last_adaptation" in data else None,
+                )
+            model._validate_training_artifacts()
 
         model._reset_caches()
         model._compute_and_cache_cholesky_factors()
@@ -2992,428 +3439,330 @@ class SpectralStateGuidedSynthesis:
         include_training_artifacts=True,
         include_adaptive_statistics=True,
     ):
-        """
-        Save model checkpoint in safetensors format.
-        
-        Safetensors is a secure format for storing tensors with:
-        - Fast loading/saving
-        - Memory-efficient
-        - Zero-copy when possible
-        - No arbitrary code execution (unlike pickle)
-        
-        Args:
-            filepath: Path to save checkpoint (.safetensors extension)
-            precision: Data type for floating point values (default: np.float32)
-            include_training_artifacts: Whether to include training data
-        """
+        """Atomically save a validated, pickle-free safetensors checkpoint."""
         try:
             from safetensors.numpy import save_file
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "safetensors is required for checkpoint saving. "
-                "Install with: pip install safetensors"
-            )
-        
-        if self.transition_matrix is None:
-            raise ValueError("Model must be trained before saving checkpoint")
-        
+                "safetensors is required for checkpoint saving. Install with: pip install safetensors"
+            ) from exc
+        transition, initial, means, covariances = self._validated_model_parameters()
+        self._compute_and_cache_cholesky_factors()
         target_dtype = np.dtype(precision)
         if target_dtype.kind != "f":
             raise ValueError("precision must be a floating-point dtype")
-        
         filepath = Path(filepath)
         if filepath.suffix != ".safetensors":
             filepath = filepath.with_suffix(".safetensors")
-        
-        # Prepare tensors dictionary
-        tensors = {}
-        
-        # Core model parameters
-        tensors["transition_matrix"] = self.transition_matrix.astype(target_dtype, copy=False)
-        tensors["initial_probabilities"] = self.initial_probabilities.astype(target_dtype, copy=False)
-        tensors["state_means"] = self.state_means.astype(target_dtype, copy=False)
-        tensors["state_covariances"] = self.state_covariances.astype(target_dtype, copy=False)
-        
-        # Training artifacts (optional)
+
+        tensors = {
+            "transition_matrix": transition.astype(target_dtype, copy=False),
+            "initial_probabilities": initial.astype(target_dtype, copy=False),
+            "state_means": means.astype(target_dtype, copy=False),
+            "state_covariances": np.asarray(self.state_covariances).astype(target_dtype, copy=False),
+        }
         if include_training_artifacts:
-            if self.training_frames is not None:
-                tensors["training_frames"] = self.training_frames.astype(target_dtype, copy=False)
-            if self.lpc_coefficients is not None:
-                tensors["lpc_coefficients"] = self.lpc_coefficients.astype(target_dtype, copy=False)
-            if self.residual_signals is not None:
-                tensors["residual_signals"] = self.residual_signals.astype(target_dtype, copy=False)
-            if self.perceptual_features is not None and self.perceptual_features.size > 0:
-                tensors["perceptual_features"] = self.perceptual_features.astype(target_dtype, copy=False)
-            if self.spectral_flux is not None and self.spectral_flux.size > 0:
-                tensors["spectral_flux"] = self.spectral_flux.astype(target_dtype, copy=False)
-            
-            # Frame metadata
-            if self.frame_metadata:
-                for key, values in self.frame_metadata.items():
-                    arr = np.asarray(values)
-                    if arr.dtype.kind == "f":
-                        arr = arr.astype(target_dtype, copy=False)
-                    tensors[f"frame_metadata__{key}"] = arr
-        
-        # Prepare metadata as a JSON string stored as bytes
-        # Note: safetensors metadata values must be strings
+            for key, value in (
+                ("training_frames", self.training_frames),
+                ("lpc_coefficients", self.lpc_coefficients),
+                ("residual_signals", self.residual_signals),
+                ("perceptual_features", self.perceptual_features),
+                ("spectral_flux", self.spectral_flux),
+            ):
+                if value is not None and np.asarray(value).size:
+                    tensors[key] = np.asarray(value).astype(target_dtype, copy=False)
+            if self.sequence_starts is not None:
+                tensors["sequence_starts"] = np.asarray(self.sequence_starts, dtype=np.int64)
+            for key, values in (self.frame_metadata or {}).items():
+                arr = np.asarray(values)
+                if arr.dtype.kind == "f":
+                    arr = arr.astype(target_dtype, copy=False)
+                tensors[f"frame_metadata__{key}"] = arr
+
         metadata = {
             "format": "safetensors",
-            "version": "1",
+            "version": "2",
             "n_states": str(self.n_states),
             "lpc_order": str(self.lpc_order),
             "frame_size": str(self.frame_size),
             "hop_size": str(self.hop_size),
             "smoothness_weight": str(self.smoothness_weight),
+            "covariance_floor": str(self.covariance_floor),
+            "transition_pseudocount": str(self.transition_pseudocount),
+            "random_state": str(self.random_state),
             "precision": target_dtype.name,
-            "includes_training_artifacts": str(include_training_artifacts),
-            "includes_adaptive_statistics": str(include_adaptive_statistics),
+            "includes_training_artifacts": str(bool(include_training_artifacts)),
+            "includes_adaptive_statistics": str(bool(include_adaptive_statistics)),
             "sample_rate": str(self.sample_rate) if self.sample_rate is not None else "None",
-            "frame_metadata_keys": json.dumps(list(self.frame_metadata.keys()) if self.frame_metadata else []),
+            "frame_metadata_keys": json.dumps(
+                list(self.frame_metadata.keys())
+                if include_training_artifacts and self.frame_metadata
+                else []
+            ),
             "adaptive_memory_limit": str(self.adaptive_memory_limit),
+            "augmentation_applied": str(bool(self.augmentation_applied)),
         }
-
         if include_adaptive_statistics and self._adaptive_stats is not None:
             stats = self._adaptive_stats
-            tensors["adaptive_state_frame_counts"] = stats.state_frame_counts.astype(
-                target_dtype, copy=False
-            )
-            tensors["adaptive_transition_counts"] = stats.transition_counts.astype(
-                target_dtype, copy=False
-            )
-            tensors["adaptive_mean_accumulator"] = stats.mean_accumulator.astype(
-                target_dtype, copy=False
-            )
-            tensors["adaptive_second_moment"] = stats.second_moment_accumulator.astype(
-                target_dtype, copy=False
-            )
-            tensors["adaptive_initial_counts"] = stats.initial_counts.astype(
-                target_dtype, copy=False
-            )
-            tensors["adaptive_total_frames"] = np.array(stats.total_frames, dtype=target_dtype)
-            tensors["adaptive_last_adaptation"] = np.array(
-                stats.last_adaptation or "", dtype=np.str_
-            )
-        
-        # Save with metadata
-        save_file(tensors, filepath, metadata=metadata)
-        logger.info(f"Checkpoint saved to {filepath}")
+            tensors.update({
+                "adaptive_state_frame_counts": np.asarray(stats.state_frame_counts, dtype=target_dtype),
+                "adaptive_transition_counts": np.asarray(stats.transition_counts, dtype=target_dtype),
+                "adaptive_mean_accumulator": np.asarray(stats.mean_accumulator, dtype=target_dtype),
+                "adaptive_second_moment": np.asarray(stats.second_moment_accumulator, dtype=target_dtype),
+                "adaptive_initial_counts": np.asarray(stats.initial_counts, dtype=target_dtype),
+                "adaptive_total_frames": np.array(stats.total_frames, dtype=target_dtype),
+            })
+            metadata["adaptive_last_adaptation"] = stats.last_adaptation or ""
+
+        tensors = {key: np.ascontiguousarray(value) for key, value in tensors.items()}
+        self._atomic_write(
+            filepath,
+            lambda temporary: save_file(tensors, temporary, metadata=metadata),
+        )
+        logger.info("Checkpoint saved to %s", filepath)
 
     @staticmethod
     def _validate_checkpoint_tensors(tensors, metadata):
-        required_keys = [
-            "transition_matrix",
-            "initial_probabilities",
-            "state_means",
-            "state_covariances",
-        ]
+        required_keys = (
+            "transition_matrix", "initial_probabilities", "state_means", "state_covariances"
+        )
         missing = [key for key in required_keys if key not in tensors]
         if missing:
-            raise ValueError(
-                "Checkpoint missing required tensors: " + ", ".join(missing)
-            )
-
-        transition = tensors["transition_matrix"]
-        if transition.ndim != 2 or transition.shape[0] != transition.shape[1]:
-            raise ValueError("transition_matrix must be a square 2D array")
-
-        inferred_states = transition.shape[0]
-        n_states = int(metadata.get("n_states", inferred_states))
-        if inferred_states != n_states:
-            raise ValueError(
-                "transition_matrix shape does not match n_states metadata"
-            )
-
-        initial = tensors["initial_probabilities"]
-        if initial.ndim != 1 or initial.shape[0] != n_states:
-            raise ValueError(
-                "initial_probabilities must be a 1D array with length n_states"
-            )
-
-        means = tensors["state_means"]
+            raise ValueError("Checkpoint missing required tensors: " + ", ".join(missing))
+        transition = np.asarray(tensors["transition_matrix"])
+        if transition.ndim != 2 or transition.shape[0] != transition.shape[1] or transition.shape[0] == 0:
+            raise ValueError("transition_matrix must be a non-empty square 2D array")
+        n_states = transition.shape[0]
+        declared_states = int(metadata.get("n_states", n_states))
+        if n_states != declared_states:
+            raise ValueError("transition_matrix shape does not match n_states metadata")
+        initial = np.asarray(tensors["initial_probabilities"])
+        if initial.shape != (n_states,):
+            raise ValueError("initial_probabilities must have shape (n_states,)")
+        means = np.asarray(tensors["state_means"])
         if means.ndim != 2 or means.shape[0] != n_states:
             raise ValueError("state_means must be a 2D array with n_states rows")
-
         lpc_order = int(metadata.get("lpc_order", means.shape[1]))
-        if means.shape[1] != lpc_order:
+        if lpc_order <= 0 or means.shape[1] != lpc_order:
             raise ValueError("state_means shape does not match lpc_order metadata")
-
-        covariances = tensors["state_covariances"]
-        if covariances.ndim != 3:
-            raise ValueError("state_covariances must be a 3D array")
+        covariances = np.asarray(tensors["state_covariances"])
         if covariances.shape != (n_states, lpc_order, lpc_order):
             raise ValueError(
-                "state_covariances must have shape "
-                f"({n_states}, {lpc_order}, {lpc_order})"
+                f"state_covariances must have shape ({n_states}, {lpc_order}, {lpc_order})"
             )
-        
+        for name, array in (("transition_matrix", transition), ("initial_probabilities", initial),
+                            ("state_means", means), ("state_covariances", covariances)):
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"{name} contains NaN or infinite values")
+        if np.any(transition < 0) or np.any(initial < 0):
+            raise ValueError("checkpoint probability tensors must be non-negative")
+        if np.any(transition.sum(axis=1) <= 0) or initial.sum() <= 0:
+            raise ValueError("checkpoint probability tensors must have positive mass")
+
     @classmethod
     def load_checkpoint(cls, filepath):
-        """
-        Load model checkpoint from safetensors format.
-        
-        Args:
-            filepath: Path to checkpoint file (.safetensors)
-            
-        Returns:
-            SpectralStateGuidedSynthesis: Loaded model instance
-        """
+        """Load a validated safetensors checkpoint without executing serialized code."""
         try:
             from safetensors.numpy import load_file
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "safetensors is required for checkpoint loading. "
-                "Install with: pip install safetensors"
-            )
-        
+                "safetensors is required for checkpoint loading. Install with: pip install safetensors"
+            ) from exc
         filepath = Path(filepath)
         if not filepath.exists():
             raise FileNotFoundError(f"Checkpoint file not found: {filepath}")
-        
-        # Load tensors and metadata
-        tensors = load_file(filepath)
-        
-        # Parse metadata from safetensors file
-        # Safetensors stores metadata in the file header
-        import json
-        with open(filepath, 'rb') as f:
-            # Read header size (first 8 bytes)
-            header_size_bytes = f.read(8)
-            if len(header_size_bytes) != 8:
-                raise ValueError("Invalid safetensors file: unable to read header size")
-            header_size = int.from_bytes(header_size_bytes, byteorder='little')
-            # Sanity-check header size to avoid malicious or corrupted files
-            MAX_HEADER_SIZE = 1024 * 1024  # 1 MB
-            if header_size <= 0 or header_size > MAX_HEADER_SIZE:
-                raise ValueError(
-                    f"Invalid safetensors file: header size {header_size} out of bounds"
-                )
-            file_size = filepath.stat().st_size
-            if 8 + header_size > file_size:
-                raise ValueError(
-                    "Invalid safetensors file: declared header size exceeds file size"
-                )
-            # Read header
-            header_bytes = f.read(header_size)
-            if len(header_bytes) != header_size:
-                raise ValueError("Invalid safetensors file: incomplete header data")
-            header = json.loads(header_bytes.decode('utf-8'))
-            metadata = header.get('__metadata__', {})
 
-        cls._validate_checkpoint_tensors(tensors, metadata)
-        
-        # Create model instance
-        model = cls(
-            n_states=int(metadata.get("n_states", 34)),
-            lpc_order=int(metadata.get("lpc_order", 12)),
-            frame_size=int(metadata.get("frame_size", 1024)),
-            hop_size=int(metadata.get("hop_size", 256)),
-            smoothness_weight=float(metadata.get("smoothness_weight", 0.5)),
-            adaptive_memory_limit=int(metadata.get("adaptive_memory_limit", 6000)),
-        )
-        
-        # Load core model parameters
-        transition = tensors["transition_matrix"].astype(np.float64, copy=False)
-        transition = np.clip(transition, 1e-12, None)
-        transition /= transition.sum(axis=1, keepdims=True)
-        model.transition_matrix = transition
-        
-        init_probs = tensors["initial_probabilities"].astype(np.float64, copy=False)
-        init_probs = np.clip(init_probs, 1e-12, None)
-        model.initial_probabilities = init_probs / init_probs.sum()
-        
-        model.state_means = tensors["state_means"].astype(np.float64, copy=False)
-        model.state_covariances = tensors["state_covariances"].astype(np.float64, copy=False)
-        
-        # Ensure covariance matrices are positive definite after loading
-        # (precision loss during save/load may require re-regularization)
-        for state in range(model.n_states):
-            cov = model.state_covariances[state]
-            # Add small regularization to ensure positive definiteness
-            min_eig = np.min(np.linalg.eigvalsh(cov))
-            if min_eig < cls.COVARIANCE_MIN_EIGENVALUE:
-                regularization = cls.COVARIANCE_MIN_EIGENVALUE - min_eig + cls.COVARIANCE_REGULARIZATION_EPSILON
-                model.state_covariances[state] = cov + np.eye(model.lpc_order) * regularization
-        
-        # Load training artifacts if present
-        if "training_frames" in tensors:
-            model.training_frames = tensors["training_frames"].astype(np.float32, copy=False)
-        if "lpc_coefficients" in tensors:
-            model.lpc_coefficients = tensors["lpc_coefficients"].astype(np.float32, copy=False)
-        if "residual_signals" in tensors:
-            model.residual_signals = tensors["residual_signals"].astype(np.float32, copy=False)
-        if "perceptual_features" in tensors:
-            model.perceptual_features = tensors["perceptual_features"].astype(np.float32, copy=False)
-        if "spectral_flux" in tensors:
-            model.spectral_flux = tensors["spectral_flux"].astype(np.float32, copy=False)
-        
-        # Load frame metadata
-        meta_keys_str = metadata.get("frame_metadata_keys", "[]")
-        # Parse the JSON string
+        # Bound and parse the small JSON header before asking safetensors to map arrays.
         try:
-            meta_keys = json.loads(meta_keys_str)
-        except (ValueError, json.JSONDecodeError):
-            meta_keys = []
-        
-        if meta_keys:
-            frame_meta: Dict[str, np.ndarray] = {}
-            for key in meta_keys:
-                if f"frame_metadata__{key}" in tensors:
-                    frame_meta[key] = tensors[f"frame_metadata__{key}"].copy()
-            model.frame_metadata = frame_meta
-        else:
-            model.frame_metadata = {}
-        
-        sample_rate_val = metadata.get("sample_rate", "None")
-        if sample_rate_val == "None" or sample_rate_val is None:
-            model.sample_rate = None
-        else:
-            model.sample_rate = int(sample_rate_val)
+            with filepath.open("rb") as handle:
+                header_size_bytes = handle.read(8)
+                if len(header_size_bytes) != 8:
+                    raise ValueError("Invalid safetensors file: unable to read header size")
+                header_size = int.from_bytes(header_size_bytes, byteorder="little")
+                max_header_size = 1024 * 1024
+                if header_size <= 0 or header_size > max_header_size:
+                    raise ValueError(f"Invalid safetensors file: header size {header_size} out of bounds")
+                if 8 + header_size > filepath.stat().st_size:
+                    raise ValueError("Invalid safetensors file: declared header size exceeds file size")
+                raw_header = handle.read(header_size)
+                if len(raw_header) != header_size:
+                    raise ValueError("Invalid safetensors file: incomplete header data")
+                header = json.loads(raw_header.decode("utf-8"))
+                metadata = header.get("__metadata__", {})
+                if not isinstance(metadata, dict):
+                    raise ValueError("Invalid safetensors file: metadata must be an object")
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid safetensors header: {exc}") from exc
+
+        try:
+            tensors = load_file(filepath)
+        except Exception as exc:
+            raise ValueError(f"Could not load safetensors checkpoint: {exc}") from exc
+        cls._validate_checkpoint_tensors(tensors, metadata)
+        try:
+            model = cls(
+                n_states=int(metadata.get("n_states", 34)),
+                lpc_order=int(metadata.get("lpc_order", 12)),
+                frame_size=int(metadata.get("frame_size", 1024)),
+                hop_size=int(metadata.get("hop_size", 256)),
+                smoothness_weight=float(metadata.get("smoothness_weight", 0.5)),
+                adaptive_memory_limit=int(metadata.get("adaptive_memory_limit", 6000)),
+                random_state=int(metadata.get("random_state", 0)),
+                covariance_floor=float(metadata.get("covariance_floor", 1e-4)),
+                transition_pseudocount=float(metadata.get("transition_pseudocount", 1e-6)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Checkpoint configuration is invalid: {exc}") from exc
+
+        model._restore_model_parameters(
+            tensors["transition_matrix"], tensors["initial_probabilities"],
+            tensors["state_means"], tensors["state_covariances"],
+        )
+        for key in ("training_frames", "lpc_coefficients", "residual_signals", "perceptual_features", "spectral_flux"):
+            if key in tensors:
+                setattr(model, key, tensors[key].astype(np.float32, copy=False))
+        if "sequence_starts" in tensors:
+            model.sequence_starts = tensors["sequence_starts"]
+        elif model.lpc_coefficients is not None or model.training_frames is not None:
+            model.sequence_starts = np.array([0], dtype=np.int64)
+
+        try:
+            meta_keys = json.loads(metadata.get("frame_metadata_keys", "[]"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("frame_metadata_keys metadata is invalid JSON") from exc
+        if not isinstance(meta_keys, list):
+            raise ValueError("frame_metadata_keys metadata must be a JSON list")
+        frame_meta = {}
+        for key in meta_keys:
+            tensor_key = f"frame_metadata__{key}"
+            if tensor_key not in tensors:
+                raise ValueError(f"Checkpoint is missing frame metadata tensor '{key}'")
+            frame_meta[key] = tensors[tensor_key].copy()
+        model.frame_metadata = frame_meta
+
+        sample_rate = metadata.get("sample_rate", "None")
+        model.sample_rate = None if sample_rate in (None, "None", "") else int(sample_rate)
+        model.augmentation_applied = metadata.get("augmentation_applied", "False") == "True"
 
         includes_adaptive = metadata.get("includes_adaptive_statistics", "False") == "True"
         if includes_adaptive and "adaptive_state_frame_counts" in tensors:
-            model._adaptive_stats = _AdaptiveStatistics(
-                state_frame_counts=tensors["adaptive_state_frame_counts"].astype(
-                    np.float64, copy=False
-                ),
-                transition_counts=tensors["adaptive_transition_counts"].astype(
-                    np.float64, copy=False
-                ),
-                mean_accumulator=tensors["adaptive_mean_accumulator"].astype(
-                    np.float64, copy=False
-                ),
-                second_moment_accumulator=tensors["adaptive_second_moment"].astype(
-                    np.float64, copy=False
-                ),
-                initial_counts=tensors["adaptive_initial_counts"].astype(
-                    np.float64, copy=False
-                ),
-                total_frames=float(tensors["adaptive_total_frames"].item()),
-                last_adaptation=str(tensors["adaptive_last_adaptation"].item() or "") or None,
+            adaptive_keys = (
+                "adaptive_transition_counts", "adaptive_mean_accumulator",
+                "adaptive_second_moment", "adaptive_initial_counts", "adaptive_total_frames",
             )
-        
+            missing_stats = [key for key in adaptive_keys if key not in tensors]
+            if missing_stats:
+                raise ValueError("Adaptive statistics incomplete: " + ", ".join(missing_stats))
+            model._adaptive_stats = _AdaptiveStatistics(
+                state_frame_counts=np.asarray(tensors["adaptive_state_frame_counts"], dtype=np.float64),
+                transition_counts=np.asarray(tensors["adaptive_transition_counts"], dtype=np.float64),
+                mean_accumulator=np.asarray(tensors["adaptive_mean_accumulator"], dtype=np.float64),
+                second_moment_accumulator=np.asarray(tensors["adaptive_second_moment"], dtype=np.float64),
+                initial_counts=np.asarray(tensors["adaptive_initial_counts"], dtype=np.float64),
+                total_frames=float(np.asarray(tensors["adaptive_total_frames"]).item()),
+                last_adaptation=metadata.get("adaptive_last_adaptation") or None,
+            )
+            stats = model._adaptive_stats
+            expected = (
+                (model.n_states,),
+                (model.n_states, model.n_states),
+                (model.n_states, model.lpc_order),
+                (model.n_states, model.lpc_order, model.lpc_order),
+                (model.n_states,),
+            )
+            for name, array, shape in zip(
+                ("state_frame_counts", "transition_counts", "mean_accumulator", "second_moment_accumulator", "initial_counts"),
+                (stats.state_frame_counts, stats.transition_counts, stats.mean_accumulator, stats.second_moment_accumulator, stats.initial_counts),
+                expected,
+            ):
+                if array.shape != shape or not np.all(np.isfinite(array)):
+                    raise ValueError(f"Adaptive statistic {name} has invalid shape or values")
+            if not np.isfinite(stats.total_frames) or stats.total_frames < 0:
+                raise ValueError("Adaptive total_frames must be finite and non-negative")
+
+        model._validate_training_artifacts()
         model._reset_caches()
         model._compute_and_cache_cholesky_factors()
         model._transition_cost_matrix()
-        
-        logger.info(f"Checkpoint loaded from {filepath}")
+        logger.info("Checkpoint loaded from %s", filepath)
         return model
 
     def extract_features_from_files(self, audio_files, sample_rate=16000):
+        """Extract multiple audio inputs, preserving each file as an HMM sequence.
+
+        Path inputs are decoded with soundfile and resampled to ``sample_rate``.
+        Array inputs are assumed to already use that rate. Mono and samples-by-
+        channels arrays are accepted; all features remain in chronological order.
         """
-        Extract features from multiple audio files and concatenate them.
-        
-        Args:
-            audio_files: List of file paths or audio signal arrays
-            sample_rate: Sampling rate (used if loading from files)
-            
-        Returns:
-            None (sets internal state)
-        """
+        sample_rate = self._coerce_sample_rate(sample_rate)
+        audio_files = list(audio_files)
+        if not audio_files:
+            raise ValueError("audio_files must contain at least one input")
+
         all_frames = []
-        all_lpc_coefficients = []
-        all_residual_signals = []
-        all_perceptual_features = []
-        all_spectral_flux = []
-        
+        all_lpc = []
+        all_residuals = []
+        all_perceptual = []
+        all_flux = []
+        sequence_starts = []
+        total_frames = 0
+        mel_filters = self._mel_filter_bank(sample_rate, self.frame_size)
+        erb_filters = self._erb_filter_bank(sample_rate, self.frame_size)
+        window = np.hanning(self.frame_size).astype(np.float32)
+
         for idx, audio_input in enumerate(audio_files):
-            print(f"  Processing file {idx + 1}/{len(audio_files)}...")
-            
-            # Load audio if it's a file path
             if isinstance(audio_input, (str, Path)):
                 try:
                     import soundfile as sf
-                    audio_signal, file_sr = sf.read(audio_input)
-                    if audio_signal.ndim > 1:
-                        # Convert to mono if stereo
-                        audio_signal = audio_signal.mean(axis=1)
-                    # Resample if needed
-                    if file_sr != sample_rate:
-                        from math import gcd
-                        g = gcd(int(sample_rate), int(file_sr))
-                        up = int(sample_rate) // g
-                        down = int(file_sr) // g
-                        try:
-                            from scipy.signal import resample_poly
-                            audio_signal = resample_poly(audio_signal, up, down)
-                        except Exception:
-                            from scipy.signal import resample
-                            num_samples = int(len(audio_signal) * sample_rate / file_sr)
-                            audio_signal = resample(audio_signal, num_samples)
-                    audio_signal = audio_signal.astype(np.float32)
-                except Exception as e:
-                    raise ValueError(f"Failed to load audio file {audio_input}: {e}")
+                    raw_audio, file_sr = sf.read(audio_input, dtype="float32", always_2d=False)
+                except Exception as exc:
+                    raise ValueError(f"Failed to load audio file {audio_input}: {exc}") from exc
+                audio = self._prepare_audio(raw_audio, int(file_sr), sample_rate)
+                description = str(audio_input)
             else:
-                # Already an array
-                audio_signal = np.asarray(audio_input, dtype=np.float32)
-            
-            # Extract features for this file
-            frames = self._frame_signal(audio_signal)
-            
-            mel_filters = self._mel_filter_bank(sample_rate, self.frame_size)
-            erb_filters = self._erb_filter_bank(sample_rate, self.frame_size)
-            window = np.hanning(self.frame_size).astype(np.float32)
-            
-            (
-                processed_frames,
-                lpc_coeffs,
-                residuals,
-                perceptual_vectors,
-                flux_values,
-            ) = self._process_frame_batch(frames, mel_filters, erb_filters, window)
-            
-            if processed_frames.size > 0:
-                all_frames.append(processed_frames)
-                all_lpc_coefficients.append(lpc_coeffs)
-                all_residual_signals.append(residuals)
-                all_perceptual_features.append(perceptual_vectors)
-                all_spectral_flux.append(flux_values)
-                print(f"    Extracted {len(lpc_coeffs)} frames")
-        
+                audio = self._prepare_audio(audio_input, sample_rate, sample_rate)
+                description = f"input {idx + 1}"
+
+            frames = self._frame_signal(audio)
+            processed, coeffs, residuals, perceptual, flux = self._process_frame_batch(
+                frames, mel_filters, erb_filters, window
+            )
+            if coeffs.size == 0:
+                logger.warning("Skipping silent audio %s", description)
+                continue
+            sequence_starts.append(total_frames)
+            total_frames += len(coeffs)
+            all_frames.append(processed)
+            all_lpc.append(coeffs)
+            all_residuals.append(residuals)
+            all_perceptual.append(perceptual)
+            all_flux.append(flux)
+            logger.info("Processed %s: %d frames", description, len(coeffs))
+
         if not all_frames:
-            raise ValueError("No valid frames extracted from any files")
-        
-        # Concatenate all features while preserving temporal order within each file
+            raise ValueError("No valid frames extracted from any audio input")
+
         self.training_frames = np.concatenate(all_frames, axis=0)
-        self.lpc_coefficients = np.concatenate(all_lpc_coefficients, axis=0)
-        self.residual_signals = np.concatenate(all_residual_signals, axis=0)
-        
-        # Handle optional features that might be empty or inconsistent
-        if all_perceptual_features and len(all_perceptual_features) == len(all_frames):
-            try:
-                self.perceptual_features = np.concatenate(all_perceptual_features, axis=0)
-            except (ValueError, np.AxisError) as e:
-                # Shape mismatch during concatenation
-                print(f"Warning: Could not concatenate perceptual features: {e}")
-                self.perceptual_features = np.array([], dtype=np.float32)
-        else:
-            # No perceptual features or inconsistent per-file counts
-            self.perceptual_features = np.array([], dtype=np.float32)
-        
-        if all_spectral_flux and len(all_spectral_flux) == len(all_frames):
-            try:
-                self.spectral_flux = np.concatenate(all_spectral_flux, axis=0)
-            except (ValueError, np.AxisError) as e:
-                # Shape mismatch during concatenation
-                print(f"Warning: Could not concatenate spectral flux: {e}")
-                self.spectral_flux = np.array([], dtype=np.float32)
-        else:
-            # No spectral flux features or inconsistent per-file counts
-            self.spectral_flux = np.array([], dtype=np.float32)
-        
-        self.sample_rate = int(sample_rate)
-        
-        print(f"  Total extracted: {len(self.lpc_coefficients)} frames from {len(audio_files)} files")
-        
-        # Compute metadata for combined features
-        self._compute_frame_metadata(self.sample_rate)
-        if self.spectral_flux is not None and self.spectral_flux.size:
+        self.lpc_coefficients = np.concatenate(all_lpc, axis=0)
+        self.residual_signals = np.concatenate(all_residuals, axis=0)
+        self.perceptual_features = np.concatenate(all_perceptual, axis=0)
+        self.spectral_flux = np.concatenate(all_flux, axis=0).astype(np.float32, copy=False)
+        self.sample_rate = sample_rate
+        self.sequence_starts = np.asarray(sequence_starts, dtype=np.int64)
+
+        self._compute_frame_metadata(sample_rate)
+        if self.spectral_flux.size:
             metadata = self.frame_metadata
             metadata["spectral_flux"] = self.spectral_flux
             self.frame_metadata = metadata
-        
+
         self._reset_caches()
         self._compute_and_cache_cholesky_factors()
+        logger.info(
+            "Extracted %d frames from %d non-silent audio inputs",
+            len(self.lpc_coefficients),
+            len(sequence_starts),
+        )
 
     def train(
         self,
@@ -3503,8 +3852,15 @@ class SpectralStateGuidedSynthesis:
         """
         if self.transition_matrix is None:
             raise ValueError("Model must be trained before adaptation")
-
-        memory_limit = int(memory_limit or self.adaptive_memory_limit)
+        if isinstance(n_adaptation_iterations, (bool, np.bool_)) or not isinstance(n_adaptation_iterations, (int, np.integer)) or n_adaptation_iterations < 0:
+            raise ValueError("n_adaptation_iterations must be a non-negative integer")
+        if memory_limit is None:
+            memory_limit = self.adaptive_memory_limit
+        if isinstance(memory_limit, (bool, np.bool_)) or not isinstance(memory_limit, (int, np.integer)) or memory_limit <= 0:
+            raise ValueError("memory_limit must be a positive integer")
+        memory_limit = int(memory_limit)
+        source_rate = self._coerce_sample_rate(sample_rate)
+        analysis_rate = self.sample_rate or source_rate
         self._validate_adaptation_inputs(adaptation_rate, stability_bias, memory_blend, memory_limit)
 
         (
@@ -3516,7 +3872,7 @@ class SpectralStateGuidedSynthesis:
             frame_metadata,
         ) = self._extract_features_for_adaptation(audio_signal, sample_rate)
 
-        rng = rng or np.random.default_rng(seed)
+        rng = rng if rng is not None else (np.random.default_rng(seed) if seed is not None else self._rng)
         self._merge_training_memory(
             frames,
             lpc_coeffs,
@@ -3528,7 +3884,7 @@ class SpectralStateGuidedSynthesis:
             rng=rng,
         )
 
-        self.sample_rate = int(sample_rate)
+        self.sample_rate = analysis_rate
         self._compute_frame_metadata(self.sample_rate)
         if self.spectral_flux is not None and self.spectral_flux.size:
             metadata = self.frame_metadata
@@ -3539,11 +3895,18 @@ class SpectralStateGuidedSynthesis:
         self._compute_and_cache_cholesky_factors()
 
         observations = lpc_coeffs.astype(np.float64, copy=False)
-        gamma, xi, log_likelihood = self._expectation_step(observations)
+        adaptation_starts = np.array([0], dtype=np.int64)
+        gamma, xi, log_likelihood = self._expectation_step(
+            observations, sequence_starts=adaptation_starts
+        )
 
-        for _ in range(max(0, int(n_adaptation_iterations))):
-            self._maximization_step(observations, gamma, xi)
-            gamma, xi, log_likelihood = self._expectation_step(observations)
+        for _ in range(int(n_adaptation_iterations)):
+            self._maximization_step(
+                observations, gamma, xi, sequence_starts=adaptation_starts
+            )
+            gamma, xi, log_likelihood = self._expectation_step(
+                observations, sequence_starts=adaptation_starts
+            )
 
         self._update_adaptive_statistics(
             observations,
@@ -3551,6 +3914,7 @@ class SpectralStateGuidedSynthesis:
             xi,
             adaptation_rate=adaptation_rate,
             stability_bias=stability_bias,
+            sequence_starts=adaptation_starts,
         )
         self._apply_adaptive_statistics(stability_bias=stability_bias)
 

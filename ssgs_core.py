@@ -56,6 +56,13 @@ def lpc_coefficients(autocorr, lpc_order):
     matching the convention ``[1.0, -solution...]`` produced by the SciPy
     Toeplitz solver used previously.
     """
+    autocorr = np.asarray(autocorr, dtype=np.float64)
+    if isinstance(lpc_order, (bool, np.bool_)) or not isinstance(lpc_order, (int, np.integer)) or lpc_order <= 0:
+        raise ValueError("lpc_order must be a positive integer")
+    if autocorr.ndim != 1 or autocorr.shape[0] != int(lpc_order) + 1:
+        raise ValueError("autocorr must be 1-D with length lpc_order + 1")
+    if not np.all(np.isfinite(autocorr)):
+        raise ValueError("autocorr must contain only finite values")
     if autocorr[0] <= 1e-8:
         coeffs = np.zeros(lpc_order + 1, dtype=np.float64)
         coeffs[0] = 1.0
@@ -114,35 +121,45 @@ def _forward_solve(L, d):
 
 
 def gaussian_log_probs(state_means, state_covariances, observations):
-    """Per-frame, per-state Gaussian log-likelihoods.
-
-    ``state_means``      : (S, p)
-    ``state_covariances``: (S, p, p)
-    ``observations``     : (T, p)
-    Returns ``log_probs`` : (T, S)
-
-    Regularization mirrors ``ssgs`` exactly: Cholesky on the raw covariance,
-    falling back to a ``1e-4 * I`` jitter only when the matrix is not
-    positive-definite (this is what makes the numbers match the SciPy path).
-    """
+    """Per-frame, per-state Gaussian log-likelihoods with robust SPD repair."""
+    state_means = np.asarray(state_means, dtype=np.float64)
+    state_covariances = np.asarray(state_covariances, dtype=np.float64)
+    observations = np.asarray(observations, dtype=np.float64)
+    if state_means.ndim != 2:
+        raise ValueError("state_means must have shape (S, p)")
     S, p = state_means.shape
+    if S <= 0 or p <= 0:
+        raise ValueError("state_means must contain at least one state and one feature")
+    if state_covariances.shape != (S, p, p):
+        raise ValueError("state_covariances must have shape (S, p, p)")
+    if observations.ndim != 2 or observations.shape[1] != p:
+        raise ValueError("observations must have shape (T, p)")
+    if not all(np.all(np.isfinite(array)) for array in (state_means, state_covariances, observations)):
+        raise ValueError("Gaussian parameters and observations must be finite")
     T = observations.shape[0]
     log_probs = np.empty((T, S), dtype=np.float64)
+    if T == 0:
+        return log_probs
     const = p * np.log(2.0 * np.pi)
-    eye = np.eye(p)
+    eye = np.eye(p, dtype=np.float64)
 
-    for s in range(S):
-        cov = np.asarray(state_covariances[s], dtype=np.float64)
-        try:
-            L = np.linalg.cholesky(cov)
-        except np.linalg.LinAlgError:
-            L = np.linalg.cholesky(cov + eye * 1e-4)
+    for state in range(S):
+        cov = 0.5 * (state_covariances[state] + state_covariances[state].T)
+        jitter = 0.0
+        for attempt in range(9):
+            try:
+                L = np.linalg.cholesky(cov + eye * jitter)
+                break
+            except np.linalg.LinAlgError:
+                jitter = 1e-10 if attempt == 0 else jitter * 10.0
+        else:
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            cov = (eigvecs * np.maximum(eigvals, 1e-8)) @ eigvecs.T
+            L = np.linalg.cholesky(0.5 * (cov + cov.T))
         log_det = 2.0 * np.sum(np.log(np.diag(L)))
-        mean = state_means[s]
-        for t in range(T):
-            y = _forward_solve(L, observations[t] - mean)
-            quad = float(np.dot(y, y))
-            log_probs[t, s] = -0.5 * (quad + const + log_det)
+        solved = np.linalg.solve(L, (observations - state_means[state]).T)
+        quad = np.sum(solved * solved, axis=0)
+        log_probs[:, state] = -0.5 * (quad + const + log_det)
     return log_probs
 
 
@@ -150,46 +167,65 @@ def gaussian_log_probs(state_means, state_covariances, observations):
 # Forward-backward (EM expectation step) - NumPy reference
 # ---------------------------------------------------------------------------
 def forward_backward(log_emissions, log_init, log_trans):
-    """Log-space forward/backward for an HMM.
-
-    Returns ``(gamma, xi, log_likelihood)`` matching ``ssgs._expectation_step``.
-    Uses ``scipy.special.logsumexp`` if available, else a pure-NumPy fallback.
-    """
+    """Validated log-space forward/backward for one non-empty HMM sequence."""
     try:
         from scipy.special import logsumexp
-    except Exception:  # pragma: no cover - fallback only
-        def logsumexp(x, axis=None):
-            x = np.asarray(x)
-            m = np.max(x, axis=axis, keepdims=True)
-            out = m + np.log(np.sum(np.exp(x - m), axis=axis, keepdims=True))
-            return out.reshape(x.shape) if axis is not None else float(out)
+    except Exception:  # pragma: no cover - dependency-light fallback
+        def logsumexp(values, axis=None, keepdims=False):
+            values = np.asarray(values, dtype=np.float64)
+            maximum = np.max(values, axis=axis, keepdims=True)
+            finite_max = np.isfinite(maximum)
+            with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+                shifted = np.where(finite_max, values - maximum, -np.inf)
+                total = np.sum(np.exp(shifted), axis=axis, keepdims=True)
+                result = np.where(finite_max, maximum + np.log(total), maximum)
+            if axis is None and not keepdims:
+                return float(result.reshape(-1)[0])
+            if not keepdims:
+                result = np.squeeze(result, axis=axis)
+            return result
 
+    log_emissions = np.asarray(log_emissions, dtype=np.float64)
+    log_init = np.asarray(log_init, dtype=np.float64)
+    log_trans = np.asarray(log_trans, dtype=np.float64)
+    if log_emissions.ndim != 2 or log_emissions.shape[0] == 0 or log_emissions.shape[1] == 0:
+        raise ValueError("log_emissions must have shape (T, S) with T,S > 0")
     T, S = log_emissions.shape
+    if log_init.shape != (S,) or log_trans.shape != (S, S):
+        raise ValueError("log_init/log_trans shapes do not match log_emissions")
+    if any(np.any(np.isnan(array)) or np.any(np.isposinf(array)) for array in (log_emissions, log_init, log_trans)):
+        raise ValueError("log probabilities may contain -inf but not NaN or +inf")
+    if np.all(np.isneginf(log_init)) or np.any(np.all(np.isneginf(log_trans), axis=1)):
+        raise ValueError("initial and transition probabilities must permit a valid path")
+
     alpha = np.empty((T, S), dtype=np.float64)
     alpha[0] = log_init + log_emissions[0]
     for t in range(1, T):
         alpha[t] = logsumexp(alpha[t - 1][:, None] + log_trans, axis=0)
         alpha[t] += log_emissions[t]
 
+    log_likelihood = float(logsumexp(alpha[-1]))
+    if not np.isfinite(log_likelihood):
+        raise FloatingPointError("HMM sequence has zero or non-finite likelihood")
     beta = np.zeros((T, S), dtype=np.float64)
     for t in range(T - 2, -1, -1):
         temp = log_trans + log_emissions[t + 1] + beta[t + 1]
         beta[t] = logsumexp(temp, axis=1)
 
     log_gamma = alpha + beta
-    log_gamma -= logsumexp(log_gamma, axis=1, keepdims=True)
-    gamma = np.exp(log_gamma)
-
-    log_xi = (
-        alpha[:-1, :, None]
-        + log_trans[None, :, :]
-        + log_emissions[1:, None, :]
-        + beta[1:, None, :]
-    )
-    log_xi -= logsumexp(log_xi.reshape(T - 1, -1), axis=1)[:, None, None]
-    xi = np.exp(log_xi)
-
-    log_likelihood = float(logsumexp(alpha[-1]))
+    normalizers = logsumexp(log_gamma, axis=1, keepdims=True)
+    gamma = np.exp(log_gamma - normalizers)
+    if T == 1:
+        xi = np.empty((0, S, S), dtype=np.float64)
+    else:
+        log_xi = (
+            alpha[:-1, :, None]
+            + log_trans[None, :, :]
+            + log_emissions[1:, None, :]
+            + beta[1:, None, :]
+        )
+        log_xi -= logsumexp(log_xi.reshape(T - 1, -1), axis=1)[:, None, None]
+        xi = np.exp(log_xi)
     return gamma, xi, log_likelihood
 
 
@@ -206,7 +242,20 @@ def decode_sequence(transition_cost, smoothness, initial_cost, smoothness_weight
 
     Returns a list of ``n_frames`` state indices.
     """
-    S = smoothness.shape[0]
+    transition_cost = np.asarray(transition_cost, dtype=np.float64)
+    smoothness = np.asarray(smoothness, dtype=np.float64)
+    initial_cost = np.asarray(initial_cost, dtype=np.float64)
+    if isinstance(n_frames, (bool, np.bool_)) or not isinstance(n_frames, (int, np.integer)) or n_frames <= 0:
+        raise ValueError("n_frames must be a positive integer")
+    if transition_cost.ndim != 2 or transition_cost.shape[0] == 0 or transition_cost.shape[0] != transition_cost.shape[1]:
+        raise ValueError("transition_cost must be a non-empty square matrix")
+    S = transition_cost.shape[0]
+    if smoothness.shape != (S, S) or initial_cost.shape != (S,):
+        raise ValueError("smoothness and initial_cost shapes must match transition_cost")
+    if not np.isfinite(smoothness_weight) or smoothness_weight < 0:
+        raise ValueError("smoothness_weight must be finite and non-negative")
+    if not all(np.all(np.isfinite(array)) for array in (transition_cost, smoothness, initial_cost)):
+        raise ValueError("decode costs must be finite")
     if smoothness_weight <= 0.0:
         dp = np.empty((n_frames, S), dtype=np.float64)
         back = np.zeros((n_frames, S), dtype=np.int32)
