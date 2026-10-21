@@ -22,7 +22,7 @@ Test enhanced generative capabilities (112% and 163% increases)
 import numpy as np
 import pytest
 from ssgs import SpectralStateGuidedSynthesis
-from test_utils import create_simple_test_signal
+from ssgs.signals import create_simple_test_signal
 
 
 def test_default_uses_enhanced_capabilities():

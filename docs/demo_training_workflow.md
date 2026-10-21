@@ -6,7 +6,7 @@ This document demonstrates the complete training workflow with safetensor checkp
 
 ```bash
 # Train on audio files from training folders
-python train_on_folder.py --folders training_001 training_002 \
+python examples/train_on_folder.py --folders training_001 training_002 \
     --n-iterations 20 \
     --checkpoint-interval 5 \
     --n-states 34
@@ -62,7 +62,7 @@ sf.write('outputs/balanced.wav', balanced, 16000)
 
 ```python
 # Resume from a checkpoint to continue training
-python train_on_folder.py \
+python examples/train_on_folder.py \
     --resume models/checkpoint_epoch_10.safetensors \
     --n-iterations 10  # Train 10 more iterations
 ```
@@ -103,7 +103,7 @@ audio = model.generate(duration_seconds=3.0)
 
 ```python
 # Test that checkpoints work correctly
-python test_checkpoints.py
+python tests/test_checkpoints.py
 ```
 
 **Expected output:**

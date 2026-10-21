@@ -214,7 +214,7 @@ def main():
     print(" Examples Complete!")
     print("=" * 70)
     print("\nNext steps:")
-    print("  1. Train on real audio: python train_on_folder.py --folders training_001")
+    print("  1. Train on real audio: python examples/train_on_folder.py --folders training_001")
     print("  2. Load checkpoint: ssgs = SpectralStateGuidedSynthesis.load_checkpoint('models/checkpoint_final.safetensors')")
     print("  3. Generate audio: audio = ssgs.generate(duration_seconds=5.0)")
     print("=" * 70)

@@ -19,7 +19,7 @@ SSGS supports:
 Train a model on MP3 files in the `training_001` and `training_002` folders:
 
 ```bash
-python train_on_folder.py --folders training_001 training_002
+python examples/train_on_folder.py --folders training_001 training_002
 ```
 
 This will:
@@ -59,7 +59,7 @@ sf.write('output.wav', audio, 16000)
 The `train_on_folder.py` script supports the following options:
 
 ```bash
-python train_on_folder.py [OPTIONS]
+python examples/train_on_folder.py [OPTIONS]
 
 Options:
   --folders FOLDER [FOLDER ...]
@@ -94,19 +94,19 @@ Options:
 
 ```bash
 # Train on custom folders with more iterations
-python train_on_folder.py --folders my_audio --n-iterations 30
+python examples/train_on_folder.py --folders my_audio --n-iterations 30
 
 # Train with frequent checkpoints
-python train_on_folder.py --checkpoint-interval 2
+python examples/train_on_folder.py --checkpoint-interval 2
 
 # Resume from checkpoint
-python train_on_folder.py --resume models/checkpoint_epoch_10.safetensors
+python examples/train_on_folder.py --resume models/checkpoint_epoch_10.safetensors
 
 # Train with more states for higher quality
-python train_on_folder.py --n-states 42
+python examples/train_on_folder.py --n-states 42
 
 # Recursively discover audio and pin initialization for repeatability
-python train_on_folder.py --folders corpus --recursive --seed 42
+python examples/train_on_folder.py --folders corpus --recursive --seed 42
 ```
 
 ## Checkpoint Format
@@ -187,10 +187,10 @@ Run the checkpoint tests to verify functionality:
 
 ```bash
 # Test checkpoint save/load
-python test_checkpoints.py
+python tests/test_checkpoints.py
 
 # Run example demonstrations
-python example_checkpoints.py
+python examples/example_checkpoints.py
 ```
 
 ## Compatibility

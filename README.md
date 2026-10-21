@@ -180,9 +180,9 @@ More states = more spectral patterns the model can learn and generate = richer, 
 
 SSGS produces time-domain and spectral visualizations like this:
 
-![SSGS demo output](ssgs_demo.png)
+![SSGS demo output](data/ssgs_demo.png)
 
-For a deeper comparison diagnostic, see `ssgs_analysis.png`.
+For a deeper comparison diagnostic, see `data/ssgs_analysis.png`.
 
 The generated signal is not a copy —  
 it is a **new trajectory** through learned spectral states.
@@ -200,19 +200,19 @@ pip install -r requirements.txt
 Run the demo training + generation script:
 
 ```bash
-python test_ssgs.py
+python tests/test_ssgs.py
 ```
 
 Run the enhanced capabilities demo (defaults to 34 states):
 
 ```bash
-python demo_enhanced_capabilities.py
+python examples/demo_enhanced_capabilities.py
 ```
 
 Train on folders of audio with checkpointing:
 
 ```bash
-python train_on_folder.py --folders training_001 training_002
+python examples/train_on_folder.py --folders training_001 training_002
 ```
 
 ## Robustness, Input Handling & Reproducibility
@@ -284,7 +284,7 @@ The returned `FrameQueryResult` includes indices, optional distances, and frame 
 ## Performance: Native Compiled Backend
 
 The numeric hot loops are also implemented as a small, dependency-light C
-library (`ssgs_native.c`) and exposed through `ssgs_native.py`. `ssgs.py`
+library (`src/ssgs/ssgs_native.c`) and exposed through `ssgs.native`. `ssgs.model`
 automatically uses them when `libssgs_native.so` is loadable, and falls back to
 the existing SciPy/NumPy paths otherwise — so the package still works on a
 machine with no compiler installed.
@@ -301,14 +301,14 @@ output:
 | Gaussian emission     | 0.0014 s    | 0.0012 s   | 1.2×    |
 | decode (2000 frames)  | 0.4998 s    | 0.0029 s   | 170×    |
 
-The C kernels are numerically identical to `ssgs.py` (enforced by
-`test_regression_guard.py`). Build the library with:
+The C kernels are numerically identical to `ssgs.model` (enforced by
+`tests/test_regression_guard.py`). Build the library with:
 
 ```bash
-make            # produces libssgs_native.so (requires gcc)
+make            # produces src/ssgs/libssgs_native.so (requires gcc)
 ```
 
-A pure-NumPy reference implementation lives in `ssgs_core.py` and is used by the
+A pure-NumPy reference implementation lives in `ssgs.core` (`src/ssgs/core.py`) and is used by the
 regression guard to prove equivalence even when the compiled library is absent.
 
 ---
@@ -318,21 +318,21 @@ regression guard to prove equivalence even when the compiled library is absent.
 Run individual checks as standalone scripts:
 
 ```bash
-python test_ssgs.py
-python test_checkpoints.py
-python test_adaptive_persistence.py
-python test_data_indexing.py
-python test_gain_control.py
-python test_generative_capabilities.py
-python test_utils.py
+python tests/test_ssgs.py
+python tests/test_checkpoints.py
+python tests/test_adaptive_persistence.py
+python tests/test_data_indexing.py
+python tests/test_gain_control.py
+python tests/test_generative_capabilities.py
+python tests/test_signal_generators.py
 ```
 
 Numeric-equivalence and performance gates:
 
 ```bash
-python ssgs_core.py               # pure-NumPy core self-test (equivalence oracle)
-python ssgs_native.py             # compiled-kernel verify + benchmark
-python test_regression_guard.py   # native load + core/pipeline equivalence
+python -m ssgs.core               # pure-NumPy core self-test (equivalence oracle)
+python -m ssgs.native             # compiled-kernel verify + benchmark
+python tests/test_regression_guard.py   # native load + core/pipeline equivalence
 ```
 
 
@@ -352,26 +352,28 @@ If unavailable, SSGS falls back to the SciPy/NumPy paths automatically.
 
 ### Project Structure
 
-ssgs.py                        # Full model implementation \
-ssgs_core.py                   # Pure-NumPy reference kernels (equivalence oracle) \
-ssgs_native.c                  # Compiled C kernels (Levinson-Durbin, emission, EM, decode) \
-ssgs_native.py                 # ctypes wrapper + benchmark for the C kernels \
-train_on_folder.py             # Folder-based training with checkpointing \
-demo_enhanced_capabilities.py  # State-count showcase \
-example_checkpoints.py         # Checkpoint usage example \
-example_fidelity.py            # Fidelity-focused generation example \
-test_ssgs.py                   # Training + generation demo \
-test_checkpoints.py            # Checkpoint save/load tests \
-test_adaptive_persistence.py   # Adaptive learning tests \
-test_data_indexing.py          # Feature index tests \
-test_gain_control.py           # Gain control tests \
-test_generative_capabilities.py # State-count tests \
-test_regression_guard.py       # Native load + core/pipeline equivalence guard \
-Makefile                       # Builds libssgs_native.so \
-requirements.txt               # Dependencies \
-ssgs_demo.png                  # Example output \
-ssgs_analysis.png              # Diagnostic output \
-README.md                      # This document \
+```
+spectro/
+├── src/ssgs/
+│   ├── __init__.py             # Package exports (SpectralStateGuidedSynthesis)
+│   ├── model.py                # Full model implementation
+│   ├── core.py                 # Pure-NumPy reference kernels (equivalence oracle)
+│   ├── native.py               # ctypes wrapper + benchmark for the C kernels
+│   └── ssgs_native.c           # Compiled C kernels (Levinson-Durbin, emission, EM, decode)
+├── tests/                      # Test suite (pytest-compatible)
+├── examples/
+│   ├── train_on_folder.py      # Folder-based training with checkpointing
+│   ├── demo_enhanced_capabilities.py  # State-count showcase
+│   ├── example_checkpoints.py  # Checkpoint usage example
+│   └── example_fidelity.py     # Fidelity-focused generation example
+├── docs/                       # Design and usage documentation
+├── data/                       # Example signals and visualizations
+├── training_001/               # Sample training audio
+├── training_002/               # Sample training audio
+├── Makefile                    # Builds src/ssgs/libssgs_native.so
+├── requirements.txt            # Dependencies
+└── README.md                   # This document
+```
 
 
 ### Authors

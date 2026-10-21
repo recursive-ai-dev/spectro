@@ -18,7 +18,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import soundfile as sf
 from ssgs import SpectralStateGuidedSynthesis
-from test_utils import create_test_signal
+from ssgs.signals import create_test_signal
 
 def _rng(seed):
     return np.random.default_rng(seed)

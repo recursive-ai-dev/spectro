@@ -336,7 +336,7 @@ implementations above are the correctness oracle for the compiled versions.
 # ---------------------------------------------------------------------------
 def _self_test():
     from ssgs import SpectralStateGuidedSynthesis
-    from test_utils import create_simple_test_signal
+    from .signals import create_simple_test_signal
 
     sr = 12000
     sig = create_simple_test_signal(sample_rate=sr, duration=1.5, seed=42)

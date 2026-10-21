@@ -17,7 +17,7 @@
 import numpy as np
 
 from ssgs import SpectralStateGuidedSynthesis
-from test_utils import create_simple_test_signal, create_test_signal
+from ssgs.signals import create_simple_test_signal, create_test_signal
 
 
 def assert_not_allclose(a, b, tol=1e-4):

@@ -30,9 +30,11 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["ssgs", "ssgs_core", "ssgs_native"]
+package-dir = {"" = "src"}
+packages = ["ssgs"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
+pythonpath = ["src", "examples"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]

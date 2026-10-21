@@ -4,18 +4,18 @@ import numpy as np
 
 
 def _assert_equivalence():
-    from ssgs_core import _self_test
+    from ssgs.core import _self_test
     print("[regression] ssgs_core._self_test ...")
     _self_test()
 
 
 def _assert_native_integration():
     from ssgs import SpectralStateGuidedSynthesis
-    from ssgs_core import (
+    from ssgs.core import (
         lpc_coefficients, gaussian_log_probs,
         decode_sequence, forward_backward,
     )
-    import ssgs_native
+    from ssgs import native as ssgs_native
 
     print("[regression] full pipeline integration (native vs core) ...")
     sr = 12000
@@ -70,7 +70,7 @@ def _assert_native_integration():
 
 def _assert_native_load():
     print("[regression] native library load check ...")
-    import ssgs_native
+    from ssgs import native as ssgs_native
     assert ssgs_native._lib is not None, \
         "libssgs_native.so missing or unloadable"
     print("[regression] native library loaded.")

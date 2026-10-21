@@ -16,7 +16,7 @@ Fidelity Levels:
 import numpy as np
 import matplotlib.pyplot as plt
 from ssgs import SpectralStateGuidedSynthesis
-from test_utils import create_fidelity_demo_signal
+from ssgs.signals import create_fidelity_demo_signal
 
 try:
     import soundfile as sf

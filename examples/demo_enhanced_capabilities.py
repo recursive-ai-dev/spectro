@@ -9,7 +9,7 @@ through higher HMM state counts.
 
 import numpy as np
 from ssgs import SpectralStateGuidedSynthesis
-from test_utils import create_rich_test_signal
+from ssgs.signals import create_rich_test_signal
 
 
 def demonstrate_capability_levels():

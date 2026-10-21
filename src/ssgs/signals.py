@@ -235,16 +235,5 @@ def create_fidelity_demo_signal(sample_rate=16000, duration=3.0, rng=None, seed=
     
     # Normalize with safety guard
     signal = signal / (np.max(np.abs(signal)) + 1e-10) * 0.8
-    
+
     return signal
-
-
-def test_test_signal_generators():
-    """Verify that all test signal generators produce valid, non-empty, finite signals."""
-    sr = 16000
-    for gen_fn in [create_test_signal, create_rich_test_signal, create_simple_test_signal, create_fidelity_demo_signal]:
-        sig = gen_fn(sample_rate=sr, duration=0.2, seed=42)
-        assert len(sig) == int(sr * 0.2)
-        assert not np.isnan(sig).any()
-        assert not np.isinf(sig).any()
-        assert np.max(np.abs(sig)) > 0.0

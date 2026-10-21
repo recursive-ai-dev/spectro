@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from ssgs import SpectralStateGuidedSynthesis
-from test_utils import create_test_signal
+from ssgs.signals import create_test_signal
 
 
 def test_checkpoint_save_load():

@@ -54,14 +54,14 @@ except ImportError:  # pragma: no cover - older SciPy fallback
 
 # Optional native/core backend: compiled kernels (ssgs_native.so) or pure-NumPy core
 try:
-    import ssgs_core
+    from . import core as ssgs_core
     _CORE_BACKEND_AVAILABLE = True
 except Exception:  # pragma: no cover
     ssgs_core = None  # type: ignore
     _CORE_BACKEND_AVAILABLE = False
 
 try:
-    import ssgs_native
+    from . import native as ssgs_native
     # Ensure the native .so is actually loadable (ctypes already loaded it)
     if ssgs_native._lib is not None:
         _NATIVE_BACKEND_AVAILABLE = True

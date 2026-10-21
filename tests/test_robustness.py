@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from ssgs import SpectralStateGuidedSynthesis
-from ssgs_core import forward_backward, gaussian_log_probs
+from ssgs.core import forward_backward, gaussian_log_probs
 
 
 def _manual_model(n_states=2, lpc_order=2):

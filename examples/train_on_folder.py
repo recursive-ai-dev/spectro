@@ -25,9 +25,9 @@ This script:
 4. Exports final model in both .npz and .safetensors formats
 
 Usage:
-    python train_on_folder.py --folders training_001 training_002
-    python train_on_folder.py --folders training_001 --checkpoint-interval 5
-    python train_on_folder.py --resume models/checkpoint_epoch_5.safetensors
+    python examples/train_on_folder.py --folders training_001 training_002
+    python examples/train_on_folder.py --folders training_001 --checkpoint-interval 5
+    python examples/train_on_folder.py --resume models/checkpoint_epoch_5.safetensors
 """
 
 import argparse

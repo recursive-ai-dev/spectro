@@ -1,15 +1,18 @@
 # Build the compiled SSGS numeric kernels.
-# Usage: make   (produces libssgs_native.so, loadable by ssgs_native.py)
+# Usage: make   (produces src/ssgs/libssgs_native.so, loadable by ssgs.native)
 
 CC ?= gcc
 CFLAGS ?= -shared -fPIC -O3
 
-libssgs_native.so: ssgs_native.c
-	$(CC) $(CFLAGS) -o $@ ssgs_native.c -lm
+NATIVE_SRC := src/ssgs/ssgs_native.c
+NATIVE_LIB := src/ssgs/libssgs_native.so
+
+$(NATIVE_LIB): $(NATIVE_SRC)
+	$(CC) $(CFLAGS) -o $@ $(NATIVE_SRC) -lm
 
 .PHONY: clean rebuild
 clean:
-	rm -f libssgs_native.so
+	rm -f $(NATIVE_LIB)
 
 rebuild: clean
-	$(MAKE) libssgs_native.so
+	$(MAKE) $(NATIVE_LIB)

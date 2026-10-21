@@ -110,7 +110,7 @@ python -m pytest test_generative_capabilities.py -v
 
 Try the demonstration script to see the impact:
 ```bash
-python demo_enhanced_capabilities.py
+python examples/demo_enhanced_capabilities.py
 ```
 
 This will train models at all three capability levels and generate comparison metrics.

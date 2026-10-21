@@ -25,7 +25,7 @@ These tests are designed to validate adaptive learning with real audio signals, 
 
 ## How to Run
 ```bash
-python test_adaptive_persistence.py
+python tests/test_adaptive_persistence.py
 ```
 
 ## Expected Outcomes
@@ -127,9 +127,9 @@ Ensure deterministic test signals, explicit error paths, and checkpoint validati
 
 ## How to Run
 ```bash
-python test_data_indexing.py
-python test_checkpoints.py
-python test_generative_capabilities.py
+python tests/test_data_indexing.py
+python tests/test_checkpoints.py
+python tests/test_generative_capabilities.py
 ```
 
 ## Expected Outcomes
@@ -153,8 +153,8 @@ Ensure the documentation references executable scripts and valid APIs so onboard
 
 ## How to Run (Spot Checks)
 ```bash
-python test_ssgs.py
-python test_checkpoints.py
+python tests/test_ssgs.py
+python tests/test_checkpoints.py
 ```
 
 ## Expected Outcomes
