@@ -83,11 +83,29 @@ void ssgs_gaussian_logprobs(const double *means, const double *covs,
     }
     for (int s = 0; s < S; s++) {
         const double *cov = covs + s * p * p;
-        int ok = chol_lower(cov, p, L);
-        if (!ok) {
+        /* Symmetrise first (mirrors ssgs_core.gaussian_log_probs), then try
+         * Cholesky with escalating diagonal jitter.  The previous code made
+         * a single 1e-4 attempt and ignored its failure, leaving L partly
+         * zero and producing NaNs via division by L[j][j] == 0 for
+         * non-PSD covariances.  Last resort mirrors the core's eigenvalue
+         * floor: fall back to 1e-8 * I so output stays finite. */
+        for (int i = 0; i < p; i++)
+            for (int j = 0; j < p; j++)
+                cj[i * p + j] = 0.5 * (cov[i * p + j] + cov[j * p + i]);
+        int ok = chol_lower(cj, p, L);
+        double jitter = 1e-10;
+        while (!ok && jitter <= 1e-3) {
             memcpy(cj, cov, p * p * sizeof(double));
-            for (int i = 0; i < p; i++) cj[i * p + i] += 1e-4;
-            chol_lower(cj, p, L);
+            for (int i = 0; i < p; i++)
+                for (int j = 0; j < p; j++)
+                    cj[i * p + j] = 0.5 * (cov[i * p + j] + cov[j * p + i]);
+            for (int i = 0; i < p; i++) cj[i * p + i] += jitter;
+            ok = chol_lower(cj, p, L);
+            jitter *= 10.0;
+        }
+        if (!ok) {
+            for (int i = 0; i < p * p; i++) L[i] = 0.0;
+            for (int i = 0; i < p; i++) L[i * p + i] = 1e-4; /* sqrt(1e-8) */
         }
         double logdet = 0.0;
         for (int i = 0; i < p; i++) logdet += log(L[i * p + i]);
