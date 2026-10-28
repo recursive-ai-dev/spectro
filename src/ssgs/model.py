@@ -22,7 +22,7 @@ import os
 import tempfile
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -31,7 +31,7 @@ import numpy as np
 # Configure module logger
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 from scipy import signal
 from scipy.cluster import vq
@@ -1771,7 +1771,7 @@ class SpectralStateGuidedSynthesis:
         # shrink the reconstructed means/covariances toward zero. Instead it is applied as a
         # proper Dirichlet prior (toward a uniform distribution) when the parameters are
         # reconstructed in ``_apply_adaptive_statistics``.
-        stats.last_adaptation = datetime.utcnow().isoformat() + "Z"
+        stats.last_adaptation = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def _apply_adaptive_statistics(self, stability_bias: float = 0.0) -> None:
         stats = self._adaptive_stats

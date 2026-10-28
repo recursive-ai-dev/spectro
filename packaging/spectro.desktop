@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Spectro
+GenericName=Generative Audio Workbench
+Comment=Train spectral models, synthesize audio, and explore waveforms
+Exec=spectro-gui
+TryExec=spectro-gui
+Icon=spectro
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=audio;synthesis;spectral;LPC;HMM;generative;
+StartupNotify=true
+StartupWMClass=Spectro

@@ -1,0 +1,8 @@
+include LICENSE CITATION.cff README.md Makefile requirements.txt uv.lock
+recursive-include scripts *.py
+recursive-include packaging *
+recursive-include docs *.md
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include .github/workflows *.yml
+global-exclude __pycache__ *.py[cod] *.so

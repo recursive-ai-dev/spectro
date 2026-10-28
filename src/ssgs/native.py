@@ -22,6 +22,7 @@ with the SciPy/NumPy path and (2) benchmark the speedup.
 """
 
 import ctypes
+import math
 import os
 import time
 
@@ -49,56 +50,118 @@ _lib.ssgs_decode.argtypes = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_double, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
 ]
+for _kernel in ("ssgs_lpc_levinson", "ssgs_gaussian_logprobs", "ssgs_forward_backward", "ssgs_decode"):
+    getattr(_lib, _kernel).restype = None
+
+
+def _positive_int(value, name):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or not 0 < value <= np.iinfo(np.int32).max:
+        raise ValueError(f"{name} must be a positive 32-bit integer")
+    return int(value)
+
+
+def _array(value, name, *, log_probabilities=False):
+    array = np.ascontiguousarray(value, dtype=np.float64)
+    invalid = np.isnan(array) | np.isposinf(array) if log_probabilities else ~np.isfinite(array)
+    if np.any(invalid):
+        raise ValueError(f"{name} contains invalid numeric values")
+    if any(dimension > np.iinfo(np.int32).max for dimension in array.shape):
+        raise ValueError(f"{name} dimensions exceed the native kernel limit")
+    return array
+
+
+def _check_product(name, *dimensions):
+    # C kernels use signed-int indexes as well as dimensions. Validate products
+    # before allocating outputs so a long recording cannot wrap those indexes.
+    if math.prod(dimensions) > np.iinfo(np.int32).max:
+        raise ValueError(f"{name} exceeds the native kernel indexing limit")
 
 
 def lpc_levinson(autocorr, lpc_order):
-    r = np.ascontiguousarray(autocorr, dtype=np.float64)
+    lpc_order = _positive_int(lpc_order, "lpc_order")
+    r = _array(autocorr, "autocorr")
+    if r.shape != (lpc_order + 1,):
+        raise ValueError("autocorr must have length lpc_order + 1")
     a = np.zeros(lpc_order + 1, dtype=np.float64)
     _lib.ssgs_lpc_levinson(_ptr(r), int(lpc_order), a.ctypes.data_as(ctypes.c_void_p))
     return a
 
 
 def gaussian_log_probs(state_means, state_covariances, observations):
-    means = np.ascontiguousarray(state_means, dtype=np.float64)
-    covs = np.ascontiguousarray(state_covariances, dtype=np.float64)
-    obs = np.ascontiguousarray(observations, dtype=np.float64)
+    means = _array(state_means, "state_means")
+    covs = _array(state_covariances, "state_covariances")
+    obs = _array(observations, "observations")
+    if means.ndim != 2 or min(means.shape) <= 0:
+        raise ValueError("state_means must have shape (S, p) with S,p > 0")
     S, p = means.shape
+    if covs.shape != (S, p, p):
+        raise ValueError("state_covariances must have shape (S, p, p)")
+    if obs.ndim != 2 or obs.shape[1] != p:
+        raise ValueError("observations must have shape (T, p)")
+    _check_product("state covariances", S, p, p)
+    _check_product("observations", obs.shape[0], p)
+    _check_product("emission output", obs.shape[0], S)
+    covs = np.ascontiguousarray(0.5 * (covs + covs.transpose(0, 2, 1)))
     T = obs.shape[0]
-    out = np.empty((T, S), dtype=np.float64)
+    out = np.full((T, S), np.nan, dtype=np.float64)
     _lib.ssgs_gaussian_logprobs(
         _ptr(means), _ptr(covs), _ptr(obs), S, p, T,
         out.ctypes.data_as(ctypes.c_void_p),
     )
+    if not np.all(np.isfinite(out)):
+        # The reference backend repairs indefinite covariance matrices beyond
+        # the small diagonal jitter supported by the compiled fast path.
+        from .core import gaussian_log_probs as reference
+        return reference(means, covs, obs)
     return out
 
 
 def forward_backward(log_emissions, log_init, log_trans):
-    emit = np.ascontiguousarray(log_emissions, dtype=np.float64)
-    init = np.ascontiguousarray(log_init, dtype=np.float64)
-    trans = np.ascontiguousarray(log_trans, dtype=np.float64)
+    emit = _array(log_emissions, "log_emissions", log_probabilities=True)
+    init = _array(log_init, "log_init", log_probabilities=True)
+    trans = _array(log_trans, "log_trans", log_probabilities=True)
+    if emit.ndim != 2 or min(emit.shape) <= 0:
+        raise ValueError("log_emissions must have shape (T, S) with T,S > 0")
     T, S = emit.shape
-    gamma = np.empty((T, S), dtype=np.float64)
-    xi = np.empty((T - 1, S, S), dtype=np.float64)
-    loglik = ctypes.c_double()
+    if init.shape != (S,) or trans.shape != (S, S):
+        raise ValueError("log_init/log_trans shapes do not match log_emissions")
+    _check_product("forward/backward output", T, S, S)
+    if np.all(np.isneginf(init)) or np.any(np.all(np.isneginf(trans), axis=1)):
+        raise ValueError("initial and transition probabilities must permit a valid path")
+    gamma = np.full((T, S), np.nan, dtype=np.float64)
+    xi = np.full((T - 1, S, S), np.nan, dtype=np.float64)
+    loglik = ctypes.c_double(float("nan"))
     _lib.ssgs_forward_backward(
         _ptr(emit), _ptr(init), _ptr(trans), T, S,
         gamma.ctypes.data_as(ctypes.c_void_p),
         xi.ctypes.data_as(ctypes.c_void_p),
         ctypes.byref(loglik),
     )
+    if not np.isfinite(loglik.value) or not np.all(np.isfinite(gamma)) or not np.all(np.isfinite(xi)):
+        raise FloatingPointError("HMM sequence has zero or non-finite likelihood")
     return gamma, xi, loglik.value
 
 
 def decode_sequence(transition_cost, smoothness, initial_cost, smoothness_weight, n_frames):
-    trans = np.ascontiguousarray(transition_cost, dtype=np.float64)
-    smooth = np.ascontiguousarray(smoothness, dtype=np.float64)
-    init = np.ascontiguousarray(initial_cost, dtype=np.float64)
+    n_frames = _positive_int(n_frames, "n_frames")
+    trans = _array(transition_cost, "transition_cost")
+    smooth = _array(smoothness, "smoothness")
+    init = _array(initial_cost, "initial_cost")
+    if trans.ndim != 2 or trans.shape[0] <= 0 or trans.shape[0] != trans.shape[1]:
+        raise ValueError("transition_cost must be a non-empty square matrix")
     S = trans.shape[0]
-    path = np.empty(n_frames, dtype=np.int32)
+    if smooth.shape != (S, S) or init.shape != (S,):
+        raise ValueError("smoothness/initial_cost shapes do not match transition_cost")
+    if isinstance(smoothness_weight, (bool, np.bool_)) or not isinstance(smoothness_weight, (int, float, np.integer, np.floating)) or not np.isfinite(smoothness_weight) or smoothness_weight < 0:
+        raise ValueError("smoothness_weight must be finite and non-negative")
+    _check_product("decoder workspace", n_frames, S)
+    path = np.full(n_frames, -1, dtype=np.int32)
     _lib.ssgs_decode(
         _ptr(trans), _ptr(smooth), _ptr(init), float(smoothness_weight), S, int(n_frames),
         path.ctypes.data_as(ctypes.c_void_p),
     )
+    if np.any(path < 0) or np.any(path >= S):
+        raise RuntimeError("native decoder failed to produce a valid state path")
     return path.tolist()
 
 

@@ -21,6 +21,7 @@ static double logsumexp(const double *x, int n) {
     if (n <= 0) return -1e300;
     double m = x[0];
     for (int i = 1; i < n; i++) if (x[i] > m) m = x[i];
+    if (isinf(m)) return m;
     double s = 0.0;
     for (int i = 0; i < n; i++) s += exp(x[i] - m);
     return m + log(s);
@@ -87,7 +88,10 @@ void ssgs_gaussian_logprobs(const double *means, const double *covs,
         if (!ok) {
             memcpy(cj, cov, p * p * sizeof(double));
             for (int i = 0; i < p; i++) cj[i * p + i] += 1e-4;
-            chol_lower(cj, p, L);
+            if (!chol_lower(cj, p, L)) {
+                for (int t = 0; t < T; t++) out[t * S + s] = NAN;
+                continue;
+            }
         }
         double logdet = 0.0;
         for (int i = 0; i < p; i++) logdet += log(L[i * p + i]);

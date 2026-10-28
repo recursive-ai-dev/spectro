@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+"""Debian launcher; also works from an extracted package for verification."""
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "spectro"))
+
+from ssgs.cli import main
+
+raise SystemExit(main())

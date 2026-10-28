@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+"""Launch the Spectro desktop workbench using the distribution Python."""
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "spectro"))
+
+from ssgs.desktop import main
+
+raise SystemExit(main())

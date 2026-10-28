@@ -1,4 +1,80 @@
-# SSGS — Spectral-State Guided Synthesis
+# Spectro 2 — Audio Synthesis Workbench
+
+Train spectral models from your recordings, explore their structure, and generate
+new audio from a Linux desktop app or the command line. Spectro includes the SSGS
+Python library and a compiled DSP backend.
+
+## Install on Debian / Ubuntu
+
+Build an installable package from this checkout:
+
+```bash
+make deb
+sudo apt install ./dist/spectro_2.0.0-1_amd64.deb
+```
+
+The build requires Python 3.9+, a C compiler, and `dpkg-dev`; it downloads no
+dependencies and needs no root access. The filename reflects the build machine's
+architecture. APT installs the runtime dependencies from your distribution.
+See [installation and package validation](docs/INSTALL.md) for compatibility,
+other architectures, removal, and source installation.
+
+Launch **Spectro** from your application menu, or run:
+
+```bash
+spectro gui
+```
+
+The workbench provides audio file and folder selection, background training with
+progress and cancellation between stages, model loading and saving, configurable
+generation, waveform and spectrogram previews, and WAV export. **Try demo** creates
+a synthetic source, trains a small model, and generates audio without needing a
+recording. Generated audio can be opened in your desktop's audio player.
+
+## Command-line workflows
+
+```bash
+# Complete demonstration using a synthetic source.
+spectro demo --output-dir ./spectro-demo
+
+# Learn from a directory of recordings, including subfolders.
+spectro train ./recordings --recursive --states 16 --iterations 10 \
+  --seed 42 --output ./models/voice.npz
+
+# Inspect the model, then generate a reproducible 24-bit WAV.
+spectro inspect ./models/voice.npz --json
+spectro generate ./models/voice.npz --duration 5 --method stochastic \
+  --seed 42 --sample-rate 44100 --output ./renders/voice.wav
+
+# Update a model with new recordings while keeping the original model.
+spectro adapt ./models/voice.npz ./new-recordings --recursive \
+  --output ./models/voice-adapted.safetensors
+
+# Check installed libraries, audio formats, and the selected numeric backend.
+spectro doctor
+```
+
+Use `.safetensors` instead of `.npz` to save a checkpoint. Supported source formats
+depend on the installed libsndfile; WAV, FLAC, OGG, and AIFF are commonly available.
+`spectro doctor` reports the formats on your machine. Existing output files are
+protected unless you pass `--force`. Model and audio writes publish atomically.
+Cancellation takes effect between computation stages; a running analysis or
+synthesis stage finishes before cancellation is handled.
+
+For development:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+make
+.venv/bin/python -m ssgs --help
+make test PYTHON=.venv/bin/python
+```
+
+The desktop requires Tk (`python3-tk` on Debian / Ubuntu). The Python package works
+without the optional native library and uses the NumPy/SciPy backend in that case.
+
+## SSGS — Spectral-State Guided Synthesis
 ### © 2025 Damien Davison & Michael Maillet & Sacha Davison 
 ### Recursive AI Devs  
 Licensed under the Apache License 2.0
@@ -6,7 +82,7 @@ psychcoherence@gmail.com OR therealmichaelmaillet@gmail.com
 
 SSGS (Spectral-State Guided Synthesis) is a hybrid generative audio model that
 combines **linear predictive coding (LPC)**, **hidden Markov models (HMMs)**,
-**spectral clustering**, **global graph search**, and a **physically-inspired
+**spectral clustering**, **graph constraints**, and a **physically-inspired
 Karplus–Strong excitation engine** into a single synthesis framework.
 
 Unlike classical systems that commit to a single paradigm (neural, statistical,
@@ -16,7 +92,7 @@ The result is a model that:
 
 - learns spectral structure from real signals,  
 - organizes that structure into Markov states,  
-- decodes the optimal state trajectory over time via A* search,  
+- decodes a smooth state trajectory or samples a Markov path over time,
 - generates excitation signals using string-model dynamics, and  
 - reconstructs audio by filtering excitation through LPC envelopes.
 
@@ -38,7 +114,7 @@ standard Karplus–Strong), SSGS takes:
 - LPC → spectral envelope representation  
 - HMM → temporal clustering + statistical state transitions  
 - EM → unsupervised parameter refinement  
-- A* search → globally optimal state sequence  
+- Dynamic programming → smoothness-constrained state sequence
 - Karplus–Strong → natural resonance and excitation noise  
 - Heuristics → spectral smoothness constraints  
 - Graph theory → prune invalid or degenerate state structures  
@@ -96,12 +172,13 @@ To prevent degenerate solutions, SSGS analyzes the transition graph:
 
 ---
 
-### **5. Global State Decoding (A* Search)**
-Instead of using Viterbi (which is greedy and purely local), SSGS uses **A***:
+### **5. State Decoding and Sampling**
 
-- cost function = negative log-likelihood + spectral smoothness heuristic  
-- ensures global consistency in the decoded state path  
-- supports long-range structure better than classical decoding
+Spectro supports a global dynamic-programming decoder with spectral smoothness
+constraints and a stochastic Markov sampler with adjustable temperature. Viterbi
+decoding is a global optimization, and the historical `_a_star_search` entry point
+now delegates to that decoder. Stochastic sampling offers varied state paths from
+the learned transition probabilities.
 
 ---
 

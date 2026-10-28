@@ -1,0 +1,60 @@
+.TH SPECTRO 1 "October 2026" "Spectro" "User Commands"
+.SH NAME
+spectro \- spectral-state guided audio synthesis workbench
+.SH SYNOPSIS
+.B spectro
+.I command
+.RI [ options ]
+.br
+.B spectro-gui
+.SH DESCRIPTION
+Spectro learns spectral structure from audio with linear prediction and a
+hidden Markov model, then synthesizes new audio from the learned states.
+The desktop workbench provides training, model loading, generation, and visual
+audio inspection. All processing runs locally.
+.SH COMMANDS
+.TP
+.B train
+Train a model from audio files or directories and save an NPZ or safetensors model.
+.TP
+.B generate
+Load a model and render a WAV file with a chosen duration, sample rate, and seed.
+.TP
+.B adapt
+Update an existing model from additional recordings with bounded training memory,
+then export a new model.
+.TP
+.B inspect
+Display model information. Use \fB\-\-json\fR for machine-readable output.
+.TP
+.B demo
+Train on a synthetic example and render audio without supplying recordings.
+.TP
+.B doctor
+Report dependency versions and native backend availability.
+.TP
+.B gui
+Open the desktop workbench.
+.SH OPTIONS
+Use \fBspectro \-\-help\fR or \fBspectro command \-\-help\fR for the complete
+options accepted by the installed version.
+.SH EXAMPLES
+.nf
+spectro train ./recordings --output voice.npz
+spectro generate voice.npz --output result.wav --duration 5 --seed 42
+spectro adapt voice.npz ./new-recordings --output updated.npz
+spectro inspect voice.npz --json
+spectro demo --output-dir ./spectro-demo
+spectro-gui
+.fi
+.SH FILES
+.I /usr/lib/spectro
+contains the application and compiled native kernels.
+.br
+.I /usr/share/doc/spectro
+contains the license and installation documentation.
+.SH AUTHORS
+Damien Davison, Michael Maillet, and Sacha Davison; Recursive AI Devs.
+.SH SEE ALSO
+.BR apt (8),
+.BR dpkg (1)

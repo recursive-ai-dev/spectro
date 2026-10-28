@@ -1,9 +1,9 @@
-```gitignore
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
 
 # Logs and temp files
 *.log
@@ -36,6 +36,5 @@ coverage/
 # Testing
 .pytest_cache/
 .mypy_cache/
-```
 # Built shared library (platform-specific; rebuild via `make`)
 libssgs_native.so
