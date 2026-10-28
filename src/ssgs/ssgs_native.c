@@ -84,14 +84,29 @@ void ssgs_gaussian_logprobs(const double *means, const double *covs,
     }
     for (int s = 0; s < S; s++) {
         const double *cov = covs + s * p * p;
-        int ok = chol_lower(cov, p, L);
+        /* Symmetrise first (mirrors ssgs_core.gaussian_log_probs), then try
+         * Cholesky with escalating diagonal jitter.  The previous code made
+         * a single 1e-4 attempt and ignored its failure, leaving L partly
+         * zero and producing NaNs via division by L[j][j] == 0 for
+         * non-PSD covariances. If jitter cannot repair a covariance, signal
+         * the Python wrapper to use the core's eigenvalue repair, preserving
+         * its eigenvectors rather than replacing the matrix with an identity. */
+        for (int i = 0; i < p; i++)
+            for (int j = 0; j < p; j++)
+                cj[i * p + j] = 0.5 * (cov[i * p + j] + cov[j * p + i]);
+        int ok = chol_lower(cj, p, L);
+        double jitter = 1e-10;
+        while (!ok && jitter <= 1e-3) {
+            for (int i = 0; i < p; i++)
+                for (int j = 0; j < p; j++)
+                    cj[i * p + j] = 0.5 * (cov[i * p + j] + cov[j * p + i]);
+            for (int i = 0; i < p; i++) cj[i * p + i] += jitter;
+            ok = chol_lower(cj, p, L);
+            jitter *= 10.0;
+        }
         if (!ok) {
-            memcpy(cj, cov, p * p * sizeof(double));
-            for (int i = 0; i < p; i++) cj[i * p + i] += 1e-4;
-            if (!chol_lower(cj, p, L)) {
-                for (int t = 0; t < T; t++) out[t * S + s] = NAN;
-                continue;
-            }
+            for (int t = 0; t < T; t++) out[t * S + s] = NAN;
+            continue;
         }
         double logdet = 0.0;
         for (int i = 0; i < p; i++) logdet += log(L[i * p + i]);

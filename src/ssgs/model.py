@@ -945,9 +945,25 @@ class SpectralStateGuidedSynthesis:
             raise ValueError("frame must be 1-D and longer than lpc_order")
         if not np.all(np.isfinite(frame)):
             raise ValueError("frame contains NaN or infinite samples")
-        corr = np.correlate(frame, frame, mode="full")
-        mid = len(frame) - 1
-        return corr[mid : mid + self.lpc_order + 1]
+        # Only the first ``lpc_order + 1`` lags are ever consumed (by
+        # ``_compute_lpc``), so computing the full 2*N-1 lag correlation via
+        # ``np.correlate(..., mode="full")`` is wasted O(N^2) work.  The
+        # lag-limited dot-product form is O(N * lpc_order) -- measured
+        # 75-5000x faster than the full correlation for frame sizes
+        # 4096-65536 at the default order of 12 -- and agrees with it to
+        # floating-point round-off.  For very high orders the FFT form
+        # (O(N log N), independent of the lag count) wins instead; see
+        # docs/ADVERSARIAL_EVALUATION.md for the benchmark evidence.
+        order = self.lpc_order
+        if order <= 64:
+            n = frame.size
+            return np.array(
+                [frame[: n - lag] @ frame[lag:] for lag in range(order + 1)],
+                dtype=np.float64,
+            )
+        n_fft = 1 << (2 * frame.size - 1).bit_length()
+        spectrum = np.fft.rfft(frame, n_fft)
+        return np.fft.irfft(spectrum * np.conj(spectrum), n_fft)[: order + 1]
 
     def _compute_lpc(self, frame):
         """
