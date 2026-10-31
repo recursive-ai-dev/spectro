@@ -537,4 +537,21 @@ libsndfile 1.2.0, native kernels rebuilt with `make` (`-O3`).
   checksums instead of the binaries; upload them from a networked machine with
   `gh release upload v2.0.0-sprint.1 dist/python/* dist/*.deb dist/SHA256SUMS dist/BUILD-ENVIRONMENT.json`.
 * **Blocked:** the CI-matrix commit (T15) cannot be pushed without the
-  `workflows` permission (see T15).
+  `workflows` permission (see T15). The prepared change is kept as
+  `dist/0001-ci-exercise-Python-3.9-and-3.10-with-the-guard-that-.patch`; apply
+  it with `git am` from a checkout with a `workflows`-scoped token.
+* **Hosted CI (evidence from GitHub Actions):**
+  * run `b0fb272` (branch tip as published) — **success**: Python 3.11 and 3.12
+    test jobs *and* the Debian artifact/extracted-runtime job all green.
+    The Debian job ran `scripts/check_deb.py` with `python3-tk` installed,
+    completing the desktop-import step that is blocked in the build sandbox.
+  * run on tag `v2.0.0-sprint.1` (commit `36f4051`) — **failure**: both test jobs
+    failed in `Run all tests with a virtual display` because that commit still
+    contained the matrix-consistency assertion while the workflow matrix listed
+    only 3.11/3.12 (the `workflows` permission blocker above). Commits
+    `2158cf0`/`b0fb272` scope that assertion to the workflow it verifies, and the
+    run for `b0fb272` is green; the tag itself was left in place rather than
+    rewritten.
+  * CI logs could not be downloaded from this sandbox
+    (`results-receiver.actions.githubusercontent.com` is unreachable); job and
+    step conclusions were read through the REST API.
