@@ -11,7 +11,6 @@ updated from every environment.
 """
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
