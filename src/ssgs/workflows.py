@@ -6,6 +6,7 @@ the model; this module handles paths, audio files, progress and cancellation.
 
 from __future__ import annotations
 
+import errno
 import importlib.metadata
 import os
 import platform
@@ -36,11 +37,16 @@ def _notify(progress: Progress, message: str, fraction: float, cancel=None) -> N
 
 
 def supported_audio_extensions() -> set[str]:
-    """Return common extensions supported by the installed libsndfile build."""
+    """Return common extensions supported by the installed libsndfile build.
+
+    Opus is carried in an OGG container, so ``.opus`` files are decodable
+    whenever libsndfile exposes the ``OGG`` format (its ``OPUS`` subtype).  The
+    desktop file chooser already lists ``*.opus``; discovery must agree with it.
+    """
     formats = sf.available_formats()
     mapping = {
         "WAV": {".wav", ".wave"}, "WAVEX": {".wav", ".wave"},
-        "FLAC": {".flac"}, "OGG": {".ogg", ".oga"},
+        "FLAC": {".flac"}, "OGG": {".ogg", ".oga", ".opus"},
         "AIFF": {".aif", ".aiff", ".aifc"}, "AU": {".au", ".snd"},
         "CAF": {".caf"}, "W64": {".w64"}, "RF64": {".rf64"},
         "MPEG": {".mp3"}, "MP3": {".mp3"},
@@ -104,6 +110,57 @@ def _number(value, name: str, *, minimum=None, maximum=None, positive=False) -> 
     return float(value)
 
 
+def _check_render_length(duration: float, sample_rate: int) -> None:
+    """Fail fast on render requests the model would reject after loading.
+
+    ``generate_audio`` used to load the model and only then discover that the
+    requested duration could not be allocated.  Validating here keeps invalid
+    CLI/desktop requests from touching the filesystem or doing expensive work.
+    """
+    SpectralStateGuidedSynthesis._validate_render_length(duration, sample_rate)
+
+
+# Errnos reported by filesystems that cannot create hard links (FAT/exFAT,
+# some CIFS and FUSE mounts).  Existence checks still happen before publishing,
+# so these are the only cases where a fallback is safe.
+_LINK_UNSUPPORTED = {
+    errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EMLINK,
+    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+}
+
+
+def _publish(temporary, target: Path, *, force: bool) -> None:
+    """Atomically publish ``temporary`` at ``target`` without clobbering.
+
+    ``os.link`` gives a race-free create-if-absent on filesystems that support
+    hard links.  When the filesystem does not, an exclusively created
+    placeholder reserves the name and ``os.replace`` then moves the finished
+    file into place, so an existing output is still never overwritten without
+    an explicit overwrite request.
+    """
+    if force:
+        os.replace(temporary, target)
+        return
+    try:
+        os.link(temporary, target)
+        return
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno not in _LINK_UNSUPPORTED:
+            raise
+    descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    os.close(descriptor)
+    try:
+        os.replace(temporary, target)
+    except OSError:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
+
+
 def load_model(path) -> SpectralStateGuidedSynthesis:
     path = Path(path).expanduser()
     if path.suffix == ".safetensors":
@@ -123,10 +180,7 @@ def save_model(model, path, force: bool = False, include_training_artifacts: boo
             model.export_model(temporary, include_training_artifacts=include_training_artifacts)
         else:
             model.save_checkpoint(temporary, include_training_artifacts=include_training_artifacts)
-        if not force:
-            os.link(temporary, target)
-        else:
-            os.replace(temporary, target)
+        _publish(temporary, target, force=force)
     finally:
         Path(temporary).unlink(missing_ok=True)
     return target
@@ -221,11 +275,7 @@ def write_audio(path, audio, sample_rate: int, *, force: bool = False) -> Path:
     os.close(descriptor)
     try:
         sf.write(temporary, samples, sample_rate, format="WAV", subtype="PCM_24")
-        if not force:
-            # link is an atomic create-if-absent on the output filesystem.
-            os.link(temporary, target)
-        else:
-            os.replace(temporary, target)
+        _publish(temporary, target, force=force)
     finally:
         Path(temporary).unlink(missing_ok=True)
     return target
@@ -247,6 +297,7 @@ def generate_audio(
     if excitation not in {"Karplus-Strong", "Wavelet"}:
         raise ValueError("excitation must be 'Karplus-Strong' or 'Wavelet'")
     sample_rate = SpectralStateGuidedSynthesis._coerce_sample_rate(sample_rate)
+    _check_render_length(duration, sample_rate)
     _notify(progress, "Loading model…", 0.05, cancel)
     model = load_model(model_or_path) if isinstance(model_or_path, (str, Path)) else model_or_path
     _notify(progress, "Generating audio…", 0.15, cancel)
@@ -292,17 +343,37 @@ def run_demo(output_dir, *, force: bool = False, progress: Progress = None, canc
     paths = {"source": directory / "source.wav", "model": directory / "model.npz", "audio": directory / "generated.wav"}
     for name, path in paths.items():
         _output_path(path, force=force, suffixes=(".npz",) if name == "model" else (".wav",))
-    _notify(progress, "Creating a synthetic training signal…", 0.0, cancel)
-    write_audio(paths["source"], create_demo_signal(), 16000, force=force)
-    model = train_model(
-        [paths["source"]], paths["model"], n_states=8, iterations=3,
-        frame_size=512, hop_size=128, force=force, cancel=cancel,
-        progress=None if progress is None else lambda message, fraction: progress(message, 0.1 + 0.65 * fraction),
-    )
-    generate_audio(
-        model, paths["audio"], duration=2.0, force=force, cancel=cancel,
-        progress=None if progress is None else lambda message, fraction: progress(message, 0.75 + 0.25 * fraction),
-    )
+
+    # A failed stage used to leave the artifacts written so far behind, so a
+    # retry without ``force`` failed with "Output already exists" for a demo
+    # that never completed.  Only files created by this call are removed;
+    # pre-existing (possibly overwritten) files are never deleted.
+    directory_existed = directory.exists()
+    created = [path for path in paths.values() if not path.exists()]
+    try:
+        _notify(progress, "Creating a synthetic training signal…", 0.0, cancel)
+        write_audio(paths["source"], create_demo_signal(), 16000, force=force)
+        model = train_model(
+            [paths["source"]], paths["model"], n_states=8, iterations=3,
+            frame_size=512, hop_size=128, force=force, cancel=cancel,
+            progress=None if progress is None else lambda message, fraction: progress(message, 0.1 + 0.65 * fraction),
+        )
+        generate_audio(
+            model, paths["audio"], duration=2.0, force=force, cancel=cancel,
+            progress=None if progress is None else lambda message, fraction: progress(message, 0.75 + 0.25 * fraction),
+        )
+    except BaseException:
+        for path in created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        if not directory_existed:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        raise
     return paths
 
 

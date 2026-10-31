@@ -175,6 +175,15 @@ class SpectralStateGuidedSynthesis:
     # after loading from checkpoints (precision loss during save/load)
     COVARIANCE_MIN_EIGENVALUE = 1e-4
     COVARIANCE_REGULARIZATION_EPSILON = 1e-5
+    # Documented numeric limits.  Synthesis allocates one float32 sample per
+    # output frame, so an unbounded duration/sample-rate pair used to reach
+    # multi-gigabyte allocations (an unhandled MemoryError) before any useful
+    # work happened.  768 kHz covers every PCM rate libsndfile can write and
+    # one hour is far beyond a single workbench render; 2**28 samples is the
+    # largest buffer (about 1 GiB of float32) a render may request.
+    MAX_SAMPLE_RATE = 768_000
+    MAX_DURATION_SECONDS = 3600.0
+    MAX_OUTPUT_SAMPLES = 1 << 28
     
     def __init__(
         self,
@@ -592,17 +601,56 @@ class SpectralStateGuidedSynthesis:
 
         frames = self.training_frames
         frame_len = frames.shape[1]
+        n_frames = len(frames)
 
-        energy = np.sum(frames * frames, axis=1)
-        rms = np.sqrt(energy / frame_len)
-        zero_crossings = np.count_nonzero(
-            np.signbit(frames[:, :-1]) != np.signbit(frames[:, 1:]), axis=1
+        # Every metric is computed row-wise, so processing fixed-size row
+        # chunks yields bit-identical values while bounding the transient
+        # memory to a few chunk-sized arrays.  The previous whole-matrix form
+        # materialised windowed frames, the spectrum, ``power``, ``power*freqs``
+        # and the bandwidth temporaries at once: 307 MB of peak allocation for
+        # 61 MB of frames (a 24-minute training set produced >1 GB of spikes).
+        chunk_rows = max(1, min(n_frames, (1 << 22) // max(8 * frame_len, 1)))
+        energy = np.empty(n_frames, dtype=np.float32)
+        zero_crossings = np.empty(n_frames, dtype=np.int32)
+        window = np.hanning(frame_len) if sample_rate else None
+        freqs = (
+            np.fft.rfftfreq(frame_len, d=1.0 / float(sample_rate))
+            if sample_rate
+            else None
         )
+        if sample_rate:
+            centroid_values = np.empty(n_frames, dtype=np.float32)
+            bandwidth_values = np.empty(n_frames, dtype=np.float32)
+            dominant_values = np.empty(n_frames, dtype=np.float32)
+
+        for start in range(0, n_frames, chunk_rows):
+            stop = min(start + chunk_rows, n_frames)
+            block = frames[start:stop]
+            block_energy = np.sum(block * block, axis=1)
+            energy[start:stop] = block_energy
+            zero_crossings[start:stop] = np.count_nonzero(
+                np.signbit(block[:, :-1]) != np.signbit(block[:, 1:]), axis=1
+            )
+            if not sample_rate:
+                continue
+            windowed = block * window
+            spectrum = np.abs(np.fft.rfft(windowed, axis=1))
+            power = spectrum + 1e-12
+            power_sum = power.sum(axis=1)
+            block_centroid = (power * freqs).sum(axis=1) / power_sum
+            centroid_values[start:stop] = block_centroid
+            bandwidth_values[start:stop] = np.sqrt(
+                ((freqs - block_centroid[:, None]) ** 2 * power).sum(axis=1) / power_sum
+            )
+            dominant_values[start:stop] = freqs[np.argmax(power, axis=1)]
+            del windowed, spectrum, power
+
+        rms = np.sqrt(energy / frame_len)
 
         metadata: Dict[str, np.ndarray] = {
-            "energy": energy.astype(np.float32, copy=False),
+            "energy": energy,
             "rms": rms.astype(np.float32, copy=False),
-            "zero_crossings": zero_crossings.astype(np.int32, copy=False),
+            "zero_crossings": zero_crossings,
         }
 
         if self.lpc_coefficients is not None and len(self.lpc_coefficients) == len(frames):
@@ -620,22 +668,9 @@ class SpectralStateGuidedSynthesis:
             metadata["residual_rms"] = residual_rms.astype(np.float32, copy=False)  # pylint: disable=no-member
 
         if sample_rate:
-            window = np.hanning(frame_len)
-            windowed = frames * window
-            spectrum = np.abs(np.fft.rfft(windowed, axis=1))
-            freqs = np.fft.rfftfreq(frame_len, d=1.0 / float(sample_rate))
-            power = spectrum + 1e-12
-
-            centroid = (power * freqs).sum(axis=1) / power.sum(axis=1)
-            metadata["spectral_centroid"] = centroid.astype(np.float32, copy=False)  # pylint: disable=no-member
-
-            bandwidth = np.sqrt(
-                ((freqs - centroid[:, None]) ** 2 * power).sum(axis=1) / power.sum(axis=1)
-            )
-            metadata["spectral_bandwidth"] = bandwidth.astype(np.float32, copy=False)  # pylint: disable=no-member
-
-            dominant_idx = np.argmax(power, axis=1)
-            metadata["dominant_frequency"] = freqs[dominant_idx].astype(np.float32, copy=False)  # pylint: disable=no-member
+            metadata["spectral_centroid"] = centroid_values
+            metadata["spectral_bandwidth"] = bandwidth_values
+            metadata["dominant_frequency"] = dominant_values
 
         self.frame_metadata = metadata
 
@@ -810,6 +845,32 @@ class SpectralStateGuidedSynthesis:
             feature_space=feature_space,
         )
 
+    @staticmethod
+    def _validated_frame_indices(indices, count):
+        """Validate explicit frame indices for metadata lookups.
+
+        NumPy silently wraps negative indices, so ``indices=[-1]`` returned the
+        last frame while ``indices=[count]`` raised ``IndexError`` -- the same
+        typo had two different outcomes.  Both are rejected now, and
+        non-integral floats are rejected instead of being truncated.
+        """
+        values = np.asarray(indices)
+        if values.dtype.kind == "b":
+            raise ValueError("indices must contain integer frame indices")
+        if values.size and values.dtype.kind not in "iu":
+            if (
+                values.dtype.kind != "f"
+                or not np.all(np.isfinite(values))
+                or not np.all(values == np.floor(values))
+            ):
+                raise ValueError("indices must contain integer frame indices")
+        values = values.astype(np.int64, copy=False)
+        if values.ndim > 1:
+            raise ValueError("indices must be a 1-D sequence of frame indices")
+        if values.size and (np.any(values < 0) or np.any(values >= int(count))):
+            raise IndexError(f"frame index out of range for {int(count)} frames")
+        return values
+
     def get_frame_metadata(self, key=None, indices=None):
         """Retrieve frame metadata, optionally filtered by key or by frame indices."""
         if not self.frame_metadata:
@@ -818,7 +879,8 @@ class SpectralStateGuidedSynthesis:
         if key is None:
             if indices is None:
                 return {k: v.copy() for k, v in self.frame_metadata.items()}
-            idx = np.asarray(indices, dtype=np.int64)
+            first = next(iter(self.frame_metadata.values()))
+            idx = self._validated_frame_indices(indices, len(first))
             return {k: v[idx] for k, v in self.frame_metadata.items()}
 
         if key not in self.frame_metadata:
@@ -828,8 +890,7 @@ class SpectralStateGuidedSynthesis:
         if indices is None:
             return values.copy()
 
-        idx = np.asarray(indices, dtype=np.int64)
-        return values[idx]
+        return values[self._validated_frame_indices(indices, len(values))]
 
     def top_frames(self, metric, *, k=10, descending=True):
         """Rank frames by a metadata metric and return the top results."""
@@ -858,14 +919,42 @@ class SpectralStateGuidedSynthesis:
             feature_space=f"rank:{metric}",
         )
 
-    @staticmethod
-    def _coerce_sample_rate(sample_rate, name="sample_rate"):
+    @classmethod
+    def _coerce_sample_rate(cls, sample_rate, name="sample_rate"):
         if isinstance(sample_rate, (bool, np.bool_)) or not isinstance(sample_rate, (int, np.integer)):
             raise ValueError(f"{name} must be a positive integer")
         sample_rate = int(sample_rate)
         if sample_rate <= 0:
             raise ValueError(f"{name} must be a positive integer")
+        if sample_rate > cls.MAX_SAMPLE_RATE:
+            raise ValueError(
+                f"{name} must not exceed {cls.MAX_SAMPLE_RATE:,} Hz "
+                f"(got {sample_rate:,} Hz)"
+            )
         return sample_rate
+
+    @classmethod
+    def _validate_render_length(cls, duration, *sample_rates):
+        """Reject render requests that would exceed the documented memory bound.
+
+        Checked before any buffer is allocated so an accidental
+        ``--duration 100000`` fails immediately instead of spending minutes
+        resampling and then dying with ``MemoryError``.
+        """
+        if float(duration) > cls.MAX_DURATION_SECONDS:
+            raise ValueError(
+                f"requested duration {float(duration):g} s exceeds the "
+                f"{cls.MAX_DURATION_SECONDS:g} s limit per render"
+            )
+        for sample_rate in sample_rates:
+            sample_rate = cls._coerce_sample_rate(sample_rate)
+            samples = int(round(float(duration) * sample_rate))
+            if samples > cls.MAX_OUTPUT_SAMPLES:
+                raise ValueError(
+                    f"requested duration {float(duration):g} s at {sample_rate:,} Hz needs "
+                    f"{samples:,} samples, above the {cls.MAX_OUTPUT_SAMPLES:,}-sample "
+                    f"limit ({cls.MAX_OUTPUT_SAMPLES / sample_rate:,.0f} s at this rate)"
+                )
 
     def _prepare_audio(self, audio_signal, source_sample_rate, target_sample_rate=None):
         """Validate audio, downmix channels, and band-limited-resample if needed."""
@@ -1133,16 +1222,32 @@ class SpectralStateGuidedSynthesis:
             raise ValueError("frames contain NaN or infinite samples")
         if not np.isfinite(energy_threshold) or energy_threshold < 0:
             raise ValueError("energy_threshold must be finite and non-negative")
-        lpc_coeffs_list: List[np.ndarray] = []
-        residual_list: List[np.ndarray] = []
-        retained_frames: List[np.ndarray] = []
-        perceptual_vectors: List[np.ndarray] = []
+        perceptual_width = mel_filters.shape[0] + erb_filters.shape[0] + 1
+        # Energy gate first, using the same per-row dot product as before, so
+        # the retained set is identical.  The outputs are then allocated once
+        # and filled in place instead of accumulating one small NumPy array per
+        # frame in Python lists and copying everything again in ``np.array``.
+        retained = np.empty(len(frames), dtype=bool)
+        for index in range(len(frames)):
+            retained[index] = not np.dot(frames[index], frames[index]) < energy_threshold
+        kept = int(np.count_nonzero(retained))
+        if kept == 0:
+            return (
+                np.empty((0, self.frame_size), dtype=np.float32),
+                np.empty((0, self.lpc_order), dtype=np.float32),
+                np.empty((0, self.hop_size), dtype=np.float32),
+                np.empty((0, perceptual_width), dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+            )
+
+        frames_arr = np.empty((kept, frames.shape[1]), dtype=np.float32)
+        lpc_arr = np.empty((kept, self.lpc_order), dtype=np.float32)
+        residual_arr = np.empty((kept, self.hop_size), dtype=np.float32)
+        perceptual_arr = np.empty((kept, perceptual_width), dtype=np.float32)
         prev_magnitude: Optional[np.ndarray] = None
-
-        for frame in frames:
-            if np.dot(frame, frame) < energy_threshold:
-                continue
-
+        position = 0
+        for index in np.flatnonzero(retained):
+            frame = frames[index]
             windowed = frame * window
             lpc_coeffs = self._compute_lpc(windowed)
             residual = signal.lfilter(lpc_coeffs, [1.0], windowed)
@@ -1151,34 +1256,43 @@ class SpectralStateGuidedSynthesis:
                 magnitude, mel_filters, erb_filters, prev_magnitude
             )
 
-            lpc_coeffs_list.append(lpc_coeffs[1:])
-            residual_list.append(residual[: self.hop_size])
-            retained_frames.append(frame)
-            perceptual_vectors.append(perceptual_vec)
+            frames_arr[position] = frame
+            lpc_arr[position] = lpc_coeffs[1:]
+            residual_arr[position] = residual[: self.hop_size]
+            perceptual_arr[position] = perceptual_vec
+            position += 1
 
-        if not retained_frames:
-            empty_frames = np.empty((0, self.frame_size), dtype=np.float32)
-            empty_lpc = np.empty((0, self.lpc_order), dtype=np.float32)
-            empty_residual = np.empty((0, self.hop_size), dtype=np.float32)
-            empty_perceptual = np.empty((0, mel_filters.shape[0] + erb_filters.shape[0] + 1), dtype=np.float32)
-            empty_flux = np.empty(0, dtype=np.float32)
-            return empty_frames, empty_lpc, empty_residual, empty_perceptual, empty_flux
-
-        frames_arr = np.array(retained_frames, dtype=np.float32)
-        lpc_arr = np.array(lpc_coeffs_list, dtype=np.float32)
-        residual_arr = np.array(residual_list, dtype=np.float32)
-        perceptual_arr = np.array(perceptual_vectors, dtype=np.float32)
-        flux_arr = perceptual_arr[:, -1] if perceptual_arr.size else np.empty(0, dtype=np.float32)
+        # Copy instead of returning a view so mutating ``spectral_flux`` cannot
+        # silently rewrite the last column of ``perceptual_features``.
+        flux_arr = perceptual_arr[:, -1].copy()
         return frames_arr, lpc_arr, residual_arr, perceptual_arr, flux_arr
     
+    def _begin_new_training_run(self) -> None:
+        """Drop state that belongs to the previous training set.
+
+        A new extraction replaces the observations, so residual augmentation
+        must run again (``augmentation_applied`` is a per-run flag), the
+        adaptive sufficient statistics describe audio that is no longer the
+        training set, and preview snapshots belong to the old run.  Keeping any
+        of them silently changed later training and adaptation behaviour.
+        """
+        self.augmentation_applied = False
+        self._adaptive_stats = None
+        self.clear_preview_snapshots()
+        self._caches.training_history.clear()
+
     def extract_features(self, audio_signal, sample_rate):
         """
         Phase 1, Step 1: Feature Extraction using Spectral Transform and Linear Prediction
-        
+
+        Replaces the training set, so per-run state (augmentation flag,
+        adaptive statistics, previews) is reset and the model is left unchanged
+        if no frame survives energy screening.
+
         Args:
             audio_signal: Input audio signal
             sample_rate: Sampling rate
-            
+
         Returns:
             lpc_coeffs_matrix: Matrix of LPC coefficients for all frames
             residual_matrix: Matrix of residual signals
@@ -1198,15 +1312,17 @@ class SpectralStateGuidedSynthesis:
             flux_values,
         ) = self._process_frame_batch(frames, mel_filters, erb_filters, window)
 
+        # Fail before touching model state: a silent input must not discard the
+        # artifacts of a previously trained model (and leave it unusable).
+        if lpc_coeffs.size == 0:
+            raise ValueError("No valid frames extracted; check input signal")
+
+        self._begin_new_training_run()
         self.training_frames = processed_frames
         self.lpc_coefficients = lpc_coeffs
         self.residual_signals = residuals
         self.perceptual_features = perceptual_vectors
         self.sample_rate = int(sample_rate)
-
-        if self.lpc_coefficients.size == 0:
-            self.frame_metadata = {}
-            raise ValueError("No valid frames extracted; check input signal")
 
         self.spectral_flux = flux_values.astype(np.float32, copy=False)
         self.sequence_starts = np.array([0], dtype=np.int64)
@@ -1262,6 +1378,26 @@ class SpectralStateGuidedSynthesis:
 
         return processed_frames, lpc_coeffs, residuals, perceptual_vectors, flux_values, frame_metadata
     
+    def _retained_frame_mask(self, frames, energy_threshold=1e-10):
+        """Return the per-row mask of frames that survive the energy gate.
+
+        ``_process_frame_batch`` drops frames whose energy is below the
+        threshold.  Callers that need to relate output rows to input rows (for
+        example when deriving sequence boundaries) must use exactly the same
+        test, so this helper is the single place where it is expressed.
+        """
+        frames = np.asarray(frames, dtype=np.float32)
+        if frames.ndim != 2:
+            raise ValueError("frames must be 2-D")
+        if not np.isfinite(energy_threshold) or energy_threshold < 0:
+            raise ValueError("energy_threshold must be finite and non-negative")
+        retained = np.empty(len(frames), dtype=bool)
+        for index in range(len(frames)):
+            # ``not (dot < threshold)`` keeps the comparison identical to the
+            # gate in ``_process_frame_batch``.
+            retained[index] = not np.dot(frames[index], frames[index]) < energy_threshold
+        return retained
+
     def _apply_residual_augmentation(self):
         if self.augmentation_applied:
             return
@@ -1284,6 +1420,7 @@ class SpectralStateGuidedSynthesis:
         window = np.hanning(self.frame_size).astype(np.float32)
 
         original_starts = self._normalize_sequence_starts(len(self.training_frames))
+        original_slices = self._sequence_slices(len(self.training_frames), original_starts)
         augmented_frames = [self.training_frames]
         augmented_lpc = [self.lpc_coefficients]
         augmented_residuals = [self.residual_signals]
@@ -1307,8 +1444,25 @@ class SpectralStateGuidedSynthesis:
             ) = self._process_frame_batch(batch, mel_filters, erb_filters, window)
             if lpc_aug.size == 0:
                 return
+            # Derive boundaries from the frames that actually survived the
+            # energy gate.  Adding ``original_starts + offset`` assumed a 1:1
+            # correspondence; a single dropped frame shifted every later
+            # boundary, fabricating transitions between recordings (or, for
+            # larger drift, making the last start exceed the frame count).
+            retained = self._retained_frame_mask(batch)
+            if int(np.count_nonzero(retained)) != len(frames_aug):
+                raise RuntimeError(
+                    "augmented batch retention does not match the processed frame count"
+                )
             offset = sum(len(item) for item in augmented_frames)
-            augmented_sequence_starts.extend((original_starts + offset).tolist())
+            batch_starts = []
+            running = 0
+            for start, end in original_slices:
+                count = int(np.count_nonzero(retained[start:end]))
+                if count:
+                    batch_starts.append(offset + running)
+                running += count
+            augmented_sequence_starts.extend(batch_starts)
             augmented_frames.append(frames_aug)
             augmented_lpc.append(lpc_aug)
             augmented_residuals.append(residual_aug)
@@ -1521,28 +1675,29 @@ class SpectralStateGuidedSynthesis:
             raise ValueError("candidate_counts must contain at least one state count")
         if not any(value <= len(self.lpc_coefficients) for value in candidates):
             candidates = [min(self.n_states, len(self.lpc_coefficients))]
-        print(f"Auto-selecting n_states from candidates: {candidates}")
-        
+        # Diagnostics go through the module logger: printing from a library
+        # call corrupted machine-readable CLI output and test capture.
+        logger.info("Auto-selecting n_states from candidates: %s", candidates)
+
         bic_scores = {}
         for n in candidates:
             if n > len(self.lpc_coefficients):
-                print(f"  Skipping n_states={n} (exceeds frame count)")
+                logger.info("Skipping n_states=%d (exceeds frame count)", n)
                 continue
-            print(f"  Testing n_states={n}...", end=" ")
             bic = self._compute_hmm_bic(n, n_em_iterations=3)
             bic_scores[n] = bic
-            print(f"BIC={bic:.2f}")
-        
+            logger.info("n_states=%d BIC=%.2f", n, bic)
+
         if not bic_scores:
             raise ValueError(
                 f"No valid candidate state counts found. All candidates {candidate_counts} "
                 f"exceed frame count ({len(self.lpc_coefficients)}). "
                 f"Please use smaller state counts or provide more training data."
             )
-        
+
         optimal_n_states = min(bic_scores, key=bic_scores.get)
-        print(f"Selected optimal n_states={optimal_n_states} (lowest BIC)")
-        
+        logger.info("Selected optimal n_states=%d (lowest BIC)", optimal_n_states)
+
         return optimal_n_states
 
     def initialize_hmm_parameters(self):
@@ -1699,6 +1854,42 @@ class SpectralStateGuidedSynthesis:
         initial_counts = gamma[starts].sum(axis=0)
         total_frames = float(observations.shape[0])
         return counts, transition_counts, mean_accumulator, second_moment, initial_counts, total_frames
+
+    def _validate_adaptive_statistics(self, stats: "_AdaptiveStatistics") -> None:
+        """Reject persisted adaptive statistics that do not match this model.
+
+        Model archives are untrusted input.  A wrong shape, a non-finite
+        accumulator or a negative frame total used to be accepted by
+        ``load_model`` and only surfaced later -- as a NumPy broadcast error
+        inside ``adapt_to_audio``, as non-finite parameters written back into
+        the model, or as ``adaptive_frames: NaN`` in ``spectro inspect``.
+        Both loaders call this validator before installing the statistics.
+        """
+        expected = (
+            ("state_frame_counts", (self.n_states,), True),
+            ("transition_counts", (self.n_states, self.n_states), True),
+            ("mean_accumulator", (self.n_states, self.lpc_order), False),
+            ("second_moment_accumulator", (self.n_states, self.lpc_order, self.lpc_order), False),
+            ("initial_counts", (self.n_states,), True),
+        )
+        for name, shape, non_negative in expected:
+            array = np.asarray(getattr(stats, name), dtype=np.float64)
+            if array.shape != shape:
+                raise ValueError(
+                    f"Adaptive statistic {name} must have shape {shape}, got {array.shape}"
+                )
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"Adaptive statistic {name} contains NaN or infinite values")
+            # Counts are occupancy masses and can never be negative.  The mean
+            # and second-moment accumulators weight signed LPC observations, so
+            # they legitimately contain negative entries.
+            if non_negative and np.any(array < 0):
+                raise ValueError(f"Adaptive statistic {name} must be non-negative")
+        total = float(stats.total_frames)
+        if not np.isfinite(total) or total < 0:
+            raise ValueError("Adaptive total_frames must be finite and non-negative")
+        if stats.last_adaptation is not None and not isinstance(stats.last_adaptation, str):
+            raise ValueError("Adaptive last_adaptation must be a string or None")
 
     def _bootstrap_adaptive_statistics(self):
         if self.lpc_coefficients is None or self.lpc_coefficients.size == 0:
@@ -2393,7 +2584,13 @@ class SpectralStateGuidedSynthesis:
         initial = np.clip(initial, 1e-12, None)
         initial = self._normalize_probabilities(initial)
 
-        graph = csr_matrix((adjusted > 1e-6).astype(np.float64))
+        # Analyse the retained states only.  Including the rows that were just
+        # redirected counted dormant states as separate components, so the
+        # reported count (and the log line) did not describe the usable graph.
+        retained = np.flatnonzero(active)
+        graph = csr_matrix(
+            (adjusted[np.ix_(retained, retained)] > 1e-6).astype(np.float64)
+        )
         n_components, _ = _strong_components(graph)
         self.transition_matrix = adjusted
         self.initial_probabilities = initial
@@ -2975,6 +3172,12 @@ class SpectralStateGuidedSynthesis:
         else:
             output_rate = self._coerce_sample_rate(sample_rate)
         analysis_rate = self.sample_rate or output_rate
+        requested_samples = int(n_frames) * self.hop_size
+        if requested_samples > self.MAX_OUTPUT_SAMPLES:
+            raise ValueError(
+                f"n_frames={int(n_frames)} needs {requested_samples:,} samples, above the "
+                f"{self.MAX_OUTPUT_SAMPLES:,}-sample limit"
+            )
         rng = rng if rng is not None else np.random.default_rng(seed)
         if state_sequence is None:
             sequence = self.sample_state_sequence(int(n_frames), rng=rng)
@@ -3090,6 +3293,14 @@ class SpectralStateGuidedSynthesis:
             raise ValueError("fidelity must be a finite number between 0.0 and 1.0")
         if isinstance(temperature, (bool, np.bool_)) or not isinstance(temperature, (int, float, np.number)) or not np.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and greater than zero")
+        if fidelity > 0.0 and (self.residual_signals is None or self.residual_signals.size == 0):
+            warnings.warn(
+                "fidelity > 0 was requested but this model has no stored training "
+                "residuals, so synthetic excitation is used instead. Reload the model "
+                "from an artifact saved with training artifacts to enable blending.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         excitation_map = {
             "karplus-strong": "Karplus-Strong",
             "wavelet": "Wavelet",
@@ -3105,6 +3316,7 @@ class SpectralStateGuidedSynthesis:
         _, _, state_means, state_covariances = self._validated_model_parameters()
 
         analysis_rate = self.sample_rate or output_rate
+        self._validate_render_length(target_duration_seconds, output_rate, analysis_rate)
         target_output_samples = int(round(float(target_duration_seconds) * output_rate))
         target_analysis_samples = int(round(float(target_duration_seconds) * analysis_rate))
         if target_output_samples <= 0 or target_analysis_samples <= 0:
@@ -3331,13 +3543,18 @@ class SpectralStateGuidedSynthesis:
 
         if include_adaptive_statistics and self._adaptive_stats is not None:
             stats = self._adaptive_stats
+            # Adaptive sufficient statistics are additive counters that survive
+            # many save/load/adapt cycles, so they are always stored as float64
+            # even when the synthesis tensors use a lower ``precision``.  The
+            # previous behaviour rounded 47.11932555 to 47.11932373 on every
+            # export, making the reloaded model differ from the saved one.
             payload.update({
-                "adaptive_state_frame_counts": stats.state_frame_counts.astype(target_dtype, copy=False),
-                "adaptive_transition_counts": stats.transition_counts.astype(target_dtype, copy=False),
-                "adaptive_mean_accumulator": stats.mean_accumulator.astype(target_dtype, copy=False),
-                "adaptive_second_moment": stats.second_moment_accumulator.astype(target_dtype, copy=False),
-                "adaptive_initial_counts": stats.initial_counts.astype(target_dtype, copy=False),
-                "adaptive_total_frames": np.array(stats.total_frames, dtype=target_dtype),
+                "adaptive_state_frame_counts": np.asarray(stats.state_frame_counts, dtype=np.float64),
+                "adaptive_transition_counts": np.asarray(stats.transition_counts, dtype=np.float64),
+                "adaptive_mean_accumulator": np.asarray(stats.mean_accumulator, dtype=np.float64),
+                "adaptive_second_moment": np.asarray(stats.second_moment_accumulator, dtype=np.float64),
+                "adaptive_initial_counts": np.asarray(stats.initial_counts, dtype=np.float64),
+                "adaptive_total_frames": np.array(stats.total_frames, dtype=np.float64),
                 "adaptive_last_adaptation": np.array(stats.last_adaptation or "", dtype=np.str_),
             })
         payload["metadata"] = np.array(json.dumps(metadata), dtype=np.str_)
@@ -3431,7 +3648,7 @@ class SpectralStateGuidedSynthesis:
                 missing_stats = [key for key in required_stats if key not in data]
                 if missing_stats:
                     raise ValueError("Adaptive statistics incomplete: " + ", ".join(missing_stats))
-                model._adaptive_stats = _AdaptiveStatistics(
+                statistics = _AdaptiveStatistics(
                     state_frame_counts=np.asarray(data["adaptive_state_frame_counts"], dtype=np.float64),
                     transition_counts=np.asarray(data["adaptive_transition_counts"], dtype=np.float64),
                     mean_accumulator=np.asarray(data["adaptive_mean_accumulator"], dtype=np.float64),
@@ -3440,6 +3657,8 @@ class SpectralStateGuidedSynthesis:
                     total_frames=float(data["adaptive_total_frames"].item()),
                     last_adaptation=str(data["adaptive_last_adaptation"].item() or "") if "adaptive_last_adaptation" in data else None,
                 )
+                model._validate_adaptive_statistics(statistics)
+                model._adaptive_stats = statistics
             model._validate_training_artifacts()
 
         model._reset_caches()
@@ -3520,13 +3739,15 @@ class SpectralStateGuidedSynthesis:
         }
         if include_adaptive_statistics and self._adaptive_stats is not None:
             stats = self._adaptive_stats
+            # See export_model: adaptive counters are float64 bookkeeping and
+            # must not lose precision to the tensor ``precision`` setting.
             tensors.update({
-                "adaptive_state_frame_counts": np.asarray(stats.state_frame_counts, dtype=target_dtype),
-                "adaptive_transition_counts": np.asarray(stats.transition_counts, dtype=target_dtype),
-                "adaptive_mean_accumulator": np.asarray(stats.mean_accumulator, dtype=target_dtype),
-                "adaptive_second_moment": np.asarray(stats.second_moment_accumulator, dtype=target_dtype),
-                "adaptive_initial_counts": np.asarray(stats.initial_counts, dtype=target_dtype),
-                "adaptive_total_frames": np.array(stats.total_frames, dtype=target_dtype),
+                "adaptive_state_frame_counts": np.asarray(stats.state_frame_counts, dtype=np.float64),
+                "adaptive_transition_counts": np.asarray(stats.transition_counts, dtype=np.float64),
+                "adaptive_mean_accumulator": np.asarray(stats.mean_accumulator, dtype=np.float64),
+                "adaptive_second_moment": np.asarray(stats.second_moment_accumulator, dtype=np.float64),
+                "adaptive_initial_counts": np.asarray(stats.initial_counts, dtype=np.float64),
+                "adaptive_total_frames": np.array(stats.total_frames, dtype=np.float64),
             })
             metadata["adaptive_last_adaptation"] = stats.last_adaptation or ""
 
@@ -3669,7 +3890,7 @@ class SpectralStateGuidedSynthesis:
             missing_stats = [key for key in adaptive_keys if key not in tensors]
             if missing_stats:
                 raise ValueError("Adaptive statistics incomplete: " + ", ".join(missing_stats))
-            model._adaptive_stats = _AdaptiveStatistics(
+            statistics = _AdaptiveStatistics(
                 state_frame_counts=np.asarray(tensors["adaptive_state_frame_counts"], dtype=np.float64),
                 transition_counts=np.asarray(tensors["adaptive_transition_counts"], dtype=np.float64),
                 mean_accumulator=np.asarray(tensors["adaptive_mean_accumulator"], dtype=np.float64),
@@ -3678,23 +3899,8 @@ class SpectralStateGuidedSynthesis:
                 total_frames=float(np.asarray(tensors["adaptive_total_frames"]).item()),
                 last_adaptation=metadata.get("adaptive_last_adaptation") or None,
             )
-            stats = model._adaptive_stats
-            expected = (
-                (model.n_states,),
-                (model.n_states, model.n_states),
-                (model.n_states, model.lpc_order),
-                (model.n_states, model.lpc_order, model.lpc_order),
-                (model.n_states,),
-            )
-            for name, array, shape in zip(
-                ("state_frame_counts", "transition_counts", "mean_accumulator", "second_moment_accumulator", "initial_counts"),
-                (stats.state_frame_counts, stats.transition_counts, stats.mean_accumulator, stats.second_moment_accumulator, stats.initial_counts),
-                expected,
-            ):
-                if array.shape != shape or not np.all(np.isfinite(array)):
-                    raise ValueError(f"Adaptive statistic {name} has invalid shape or values")
-            if not np.isfinite(stats.total_frames) or stats.total_frames < 0:
-                raise ValueError("Adaptive total_frames must be finite and non-negative")
+            model._validate_adaptive_statistics(statistics)
+            model._adaptive_stats = statistics
 
         model._validate_training_artifacts()
         model._reset_caches()
@@ -3758,6 +3964,7 @@ class SpectralStateGuidedSynthesis:
         if not all_frames:
             raise ValueError("No valid frames extracted from any audio input")
 
+        self._begin_new_training_run()
         self.training_frames = np.concatenate(all_frames, axis=0)
         self.lpc_coefficients = np.concatenate(all_lpc, axis=0)
         self.residual_signals = np.concatenate(all_residuals, axis=0)
@@ -3789,10 +3996,11 @@ class SpectralStateGuidedSynthesis:
         preview_every: int = 0,
         preview_duration_frames: int = 32,
         preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        verbose: bool = True,
     ):
         """
         Complete training pipeline
-        
+
         Args:
             audio_signal: Training audio signal (single array) or list of audio signals/file paths
             sample_rate: Sampling rate
@@ -3800,40 +4008,35 @@ class SpectralStateGuidedSynthesis:
             preview_every: Forward previews every N EM iterations (0 disables)
             preview_duration_frames: Frame count per preview render
             preview_callback: Optional callable receiving preview metadata
+            verbose: Print per-iteration EM progress to stdout (the stage
+                summaries always go to the module logger)
         """
-        print("Phase 1: Training (HMM Parameter Estimation)")
-        print("=" * 50)
-        
+        logger.info("Training: HMM parameter estimation")
+
         # Step 1: Feature Extraction
-        print("Step 1: Extracting features (LPC analysis)...")
-        
-        # Check if we have multiple files/signals
         if isinstance(audio_signal, (list, tuple)):
-            print(f"Batch mode: Training on {len(audio_signal)} audio files/signals")
+            logger.info("Batch mode: training on %d audio files/signals", len(audio_signal))
             self.extract_features_from_files(audio_signal, sample_rate)
         else:
-            # Single signal
             self.extract_features(audio_signal, sample_rate)
-            print(f"Extracted {len(self.lpc_coefficients)} frames of LPC coefficients")
-        
+            logger.info("Extracted %d frames of LPC coefficients", len(self.lpc_coefficients))
+
         # Step 2: State Initialization
-        print("Step 2: Initializing HMM parameters...")
         self.initialize_hmm_parameters()
-        
+
         # Step 3: Iterative Learning
-        print("Step 3: Running EM algorithm...")
         self.iterative_refinement(
             n_em_iterations,
             preview_every=preview_every,
             preview_duration_frames=preview_duration_frames,
             preview_callback=preview_callback,
+            verbose=verbose,
         )
-        
+
         # Step 4: Graph Constraints
-        print("Step 4: Applying graph constraints...")
         self.identify_graph_constraints()
-        
-        print("Training complete!")
+
+        logger.info("Training complete")
 
     def adapt_to_audio(
         self,
@@ -3995,9 +4198,7 @@ class SpectralStateGuidedSynthesis:
         Returns:
             Generated audio signal
         """
-        print("Phase 2: Inference (Audio Generation)")
-        print("=" * 50)
-
+        logger.info("Inference: synthesizing audio")
         return self.synthesize_audio(
             duration_seconds,
             sample_rate,

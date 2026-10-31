@@ -32,7 +32,9 @@ flat-array ABI that a compiled (C/numba) kernel can replace 1:1.
 Scope of the "rudimentary" core
 --------------------------------
 * ``lpc_coefficients``       - Levinson-Durbin (no Toeplitz solve)
-* ``gaussian_log_probs``     - hand Cholesky + forward substitution (no SciPy)
+* ``gaussian_log_probs``     - Cholesky + triangular solve via ``numpy.linalg``
+                              (no SciPy), with eigenvalue repair for
+                              non-positive-definite covariances
 * ``forward_backward``       - log-space forward/backward (NumPy reference)
 * ``decode_sequence``        - smoothness-first lexicographic Viterbi
 
@@ -94,32 +96,8 @@ def lpc_coefficients(autocorr, lpc_order):
 
 
 # ---------------------------------------------------------------------------
-# Gaussian emission log-probabilities (hand Cholesky + forward solve)
+# Gaussian emission log-probabilities (NumPy Cholesky + triangular solve)
 # ---------------------------------------------------------------------------
-def _cholesky_lower(cov):
-    """Lower-triangular Cholesky factor L with L @ L.T == cov (p x p)."""
-    p = cov.shape[0]
-    L = np.zeros((p, p), dtype=np.float64)
-    for i in range(p):
-        for j in range(i + 1):
-            s = cov[i, j] - np.dot(L[i, :j], L[j, :j])
-            if i == j:
-                L[i, i] = np.sqrt(max(s, 1e-12))
-            else:
-                L[i, j] = s / L[j, j]
-    return L
-
-
-def _forward_solve(L, d):
-    """Solve L @ y = d for lower-triangular L (non-unit diagonal)."""
-    p = L.shape[0]
-    y = np.zeros(p, dtype=np.float64)
-    for i in range(p):
-        s = d[i] - np.dot(L[i, :i], y[:i])
-        y[i] = s / L[i, i]
-    return y
-
-
 def gaussian_log_probs(state_means, state_covariances, observations):
     """Per-frame, per-state Gaussian log-likelihoods with robust SPD repair."""
     state_means = np.asarray(state_means, dtype=np.float64)
@@ -340,7 +318,12 @@ def _self_test():
 
     sr = 12000
     sig = create_simple_test_signal(sample_rate=sr, duration=1.5, seed=42)
-    m = SpectralStateGuidedSynthesis(n_states=8, lpc_order=10, frame_size=512, hop_size=128)
+    # A fixed seed keeps this self-check reproducible: with an unseeded model
+    # every run trained different parameters, and the absolute 1e-3 tolerance
+    # on a ~1e4 log-likelihood was tight enough to fail intermittently.
+    m = SpectralStateGuidedSynthesis(
+        n_states=8, lpc_order=10, frame_size=512, hop_size=128, random_state=42
+    )
     m.extract_features(sig, sr)
     m.initialize_hmm_parameters()
     m.iterative_refinement(3)
@@ -378,7 +361,7 @@ def _self_test():
     native_gamma, native_xi, native_ll = m._expectation_step(obs[:20])
     assert np.allclose(core_gamma, native_gamma, atol=1e-3), "Gamma mismatch"
     assert np.allclose(core_xi, native_xi, atol=1e-3), "Xi mismatch"
-    assert abs(core_ll - native_ll) < 1e-3, "Log-likelihood mismatch"
+    assert abs(core_ll - native_ll) < 1e-9 * max(1.0, abs(core_ll)), "Log-likelihood mismatch"
     print("  [ok] Forward-backward (core) matches ssgs._expectation_step")
 
     print("ALL CORE SELF-TESTS PASSED")

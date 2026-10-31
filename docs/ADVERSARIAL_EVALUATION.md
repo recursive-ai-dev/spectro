@@ -94,7 +94,9 @@ alternating frames at orders 1–200, and LPC output is unchanged end-to-end.
    cross-sequence transitions, so the xi shapes mismatch (689 vs 685).
    → `verify()` now compares on one 20-frame sequence, like the regression
    guard; the module's verify + benchmark now run to completion
-   (decode: ~130× native speedup confirmed).
+   (decode: ~130× native speedup confirmed; re-measured after the sprint's
+   benchmark fix with `ssgs.core` as the reference column: decode 168×,
+   LPC 4.0×, emission 2.0×).
 
 ## Logic checks that passed (no change warranted)
 

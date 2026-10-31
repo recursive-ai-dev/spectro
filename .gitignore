@@ -38,3 +38,8 @@ coverage/
 .mypy_cache/
 # Built shared library (platform-specific; rebuild via `make`)
 libssgs_native.so
+
+# Files written into the working directory by `python tests/test_ssgs.py`
+original_signal.wav
+generated_signal.wav
+ssgs_analysis.png

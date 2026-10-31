@@ -196,7 +196,9 @@ def verify():
 
     sr = 12000
     sig = create_simple_test_signal(sample_rate=sr, duration=1.5, seed=42)
-    m = SpectralStateGuidedSynthesis(n_states=8, lpc_order=10, frame_size=512, hop_size=128)
+    m = SpectralStateGuidedSynthesis(
+        n_states=8, lpc_order=10, frame_size=512, hop_size=128, random_state=42
+    )
     m.extract_features(sig, sr)
     m.initialize_hmm_parameters()
     m.iterative_refinement(3)
@@ -240,7 +242,16 @@ def verify():
 
 
 def benchmark():
+    """Compare the compiled kernels with the pure-NumPy reference in ssgs.core.
+
+    The reference column must call ``ssgs.core`` directly.  Earlier versions
+    timed ``SpectralStateGuidedSynthesis._compute_lpc`` and
+    ``_compute_emission_log_probs``, which already dispatch to the native
+    kernels whenever the shared library is present -- the "scipy/numpy" and "C"
+    columns therefore measured the same code and reported a meaningless 1.0x.
+    """
     from ssgs import SpectralStateGuidedSynthesis
+    from . import core
     from .signals import create_simple_test_signal
 
     sr = 12000
@@ -248,7 +259,7 @@ def benchmark():
     m = SpectralStateGuidedSynthesis(n_states=34, lpc_order=12, frame_size=1024, hop_size=256)
     m.extract_features(sig, sr)
     m.initialize_hmm_parameters()
-    m.iterative_refinement(2)
+    m.iterative_refinement(2, verbose=False)
     m.identify_graph_constraints()
 
     obs = m.lpc_coefficients
@@ -256,7 +267,8 @@ def benchmark():
     sm = m._spectral_smoothness_matrix()
     init = -np.log(m.initial_probabilities + 1e-12)
     frames = m.training_frames
-    N_FRAMES = min(400, frames.shape[0])
+    n_frames = min(400, frames.shape[0])
+    autocorrelations = [m._autocorrelation(frames[i]) for i in range(n_frames)]
 
     def timeit(fn, reps=20):
         fn()
@@ -265,23 +277,34 @@ def benchmark():
             fn()
         return (time.perf_counter() - t0) / reps
 
-    # LPC over many frames
-    t_scipy_lpc = timeit(lambda: [m._compute_lpc(frames[i]) for i in range(N_FRAMES)])
-    t_c_lpc = timeit(lambda: [lpc_levinson(m._autocorrelation(frames[i]), m.lpc_order) for i in range(N_FRAMES)])
+    # LPC solvers only: the shared autocorrelation work is excluded from both.
+    t_reference_lpc = timeit(
+        lambda: [core.lpc_coefficients(a, m.lpc_order) for a in autocorrelations]
+    )
+    t_native_lpc = timeit(
+        lambda: [lpc_levinson(a, m.lpc_order) for a in autocorrelations]
+    )
 
-    # Emission
-    t_scipy_em = timeit(lambda: m._compute_emission_log_probs(obs))
-    t_c_em = timeit(lambda: gaussian_log_probs(m.state_means, m.state_covariances, obs))
+    # Emission log-likelihoods for every training frame and state.
+    t_reference_em = timeit(lambda: core.gaussian_log_probs(m.state_means, m.state_covariances, obs))
+    t_native_em = timeit(lambda: gaussian_log_probs(m.state_means, m.state_covariances, obs))
 
-    # Decode (large path - the Python triple loop is the worst offender)
-    t_scipy_dec = timeit(lambda: m._decode_state_sequence_cached(2000))
-    t_c_dec = timeit(lambda: decode_sequence(tc, sm, init, m.smoothness_weight, 2000))
+    # Decode: the NumPy reference is a triple loop and dominates the Python path.
+    t_reference_dec = timeit(
+        lambda: core.decode_sequence(tc, sm, init, m.smoothness_weight, 2000),
+        reps=3,
+    )
+    t_native_dec = timeit(lambda: decode_sequence(tc, sm, init, m.smoothness_weight, 2000))
 
-    print(f"\n{'kernel':<22}{'scipy/numpy':>14}{'C':>14}{'speedup':>12}")
-    print(f"{'-'*62}")
-    print(f"{'LPC x%d frames':<22}{t_scipy_lpc:>14.4f}{t_c_lpc:>14.4f}{t_scipy_lpc/t_c_lpc:>11.1f}x")
-    print(f"{'emission (T x S)':<22}{t_scipy_em:>14.4f}{t_c_em:>14.4f}{t_scipy_em/t_c_em:>11.1f}x")
-    print(f"{'decode 2000 frames':<22}{t_scipy_dec:>14.4f}{t_c_dec:>14.4f}{t_scipy_dec/t_c_dec:>11.1f}x")
+    print(f"\n{'kernel':<24}{'reference':>14}{'native':>14}{'speedup':>12}")
+    print(f"{'-'*64}")
+    for label, reference, native in (
+        (f"LPC x{n_frames} frames", t_reference_lpc, t_native_lpc),
+        ("emission (T x S)", t_reference_em, t_native_em),
+        ("decode 2000 frames", t_reference_dec, t_native_dec),
+    ):
+        print(f"{label:<24}{reference:>14.4f}{native:>14.4f}{reference/native:>11.1f}x")
+    print("reference = ssgs.core (pure NumPy), native = libssgs_native.so")
 
 
 if __name__ == "__main__":

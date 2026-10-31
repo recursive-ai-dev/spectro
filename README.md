@@ -55,9 +55,17 @@ spectro doctor
 ```
 
 Use `.safetensors` instead of `.npz` to save a checkpoint. Supported source formats
-depend on the installed libsndfile; WAV, FLAC, OGG, and AIFF are commonly available.
-`spectro doctor` reports the formats on your machine. Existing output files are
-protected unless you pass `--force`. Model and audio writes publish atomically.
+depend on the installed libsndfile; WAV, FLAC, OGG (including Opus), and AIFF are
+commonly available, and `spectro doctor` reports the formats on your machine.
+Existing output files are protected unless you pass `--force`. Model and audio
+writes publish atomically (a hard link when the filesystem allows it, an exclusive
+create plus `os.replace` otherwise), so an interrupted save never truncates the
+previous file.
+
+Renders are bounded before any buffer is allocated: at most 768,000 Hz, at most
+3,600 s, and at most 268,435,456 samples (1 GiB of float32) per render. Requests
+beyond a limit fail immediately with a one-line error instead of attempting a
+multi-gigabyte allocation.
 Cancellation takes effect between computation stages; a running analysis or
 synthesis stage finishes before cancellation is handled.
 
@@ -369,17 +377,21 @@ machine with no compiler installed.
 Kernels covered: LPC (Levinson–Durbin), Gaussian emission (hand Cholesky +
 forward solve), EM forward–backward, and the smoothness-first Viterbi decode.
 The decode is the dominant synthesis cost (a pure-Python triple loop in the
-SciPy build); the compiled kernel is ~170× faster there, with **identical**
-output:
+SciPy build). Measured with `python -m ssgs.native` (Python 3.11.2, NumPy 2.4.6,
+SciPy 1.17.1, `-O3`, this workstation):
 
-| kernel                | SciPy/NumPy | C          | speedup |
-|-----------------------|-------------|------------|---------|
-| LPC (Levinson–Durbin) | 0.172 s     | 0.172 s    | 1.0×    |
-| Gaussian emission     | 0.0014 s    | 0.0012 s   | 1.2×    |
-| decode (2000 frames)  | 0.4998 s    | 0.0029 s   | 170×    |
+| kernel                | `ssgs.core` reference | C library   | speedup |
+|-----------------------|-----------------------|-------------|---------|
+| LPC (340 frames)      | 0.0128 s              | 0.0032 s    | 4.0×    |
+| Gaussian emission     | 0.0028 s              | 0.0014 s    | 2.0×    |
+| decode (2000 frames)  | 0.5028 s              | 0.0030 s    | 168×    |
 
-The C kernels are numerically identical to `ssgs.model` (enforced by
-`tests/test_regression_guard.py`). Build the library with:
+The reference column times the pure-NumPy kernels in `ssgs.core`, **not**
+`SpectralStateGuidedSynthesis` methods: those already dispatch to the compiled
+library when it is loadable, which made earlier versions of this table compare
+the native kernel with itself. The C kernels are numerically identical to
+`ssgs.model` (enforced by `tests/test_regression_guard.py` and recorded in
+`TODO.md`). Build the library with:
 
 ```bash
 make            # produces src/ssgs/libssgs_native.so (requires gcc)
@@ -390,7 +402,26 @@ regression guard to prove equivalence even when the compiled library is absent.
 
 ---
 
+### Peak memory
+
+Feature extraction is streamed instead of materialising whole matrices. For a
+72,510-frame training set (297 MB of frames) the folder-training script peaks at
+**1018 MB RSS** instead of 2421 MB, `_compute_frame_metadata` peaks at 15.8 MB
+instead of 307.2 MB, and `_process_frame_batch` peaks at 80.5 MB instead of
+218.8 MB. `tests/test_resource_bounds.py` keeps those bounds honest by comparing
+transient allocation against the size of the data being processed.
+
 ## Testing
+
+```bash
+make test PYTHON=.venv/bin/python     # builds the C kernels, then runs pytest
+```
+
+The suite contains 296 pytest cases (290 execute here; the remaining 6 need a
+display for the Tk workbench). CI runs it on Python 3.9, 3.10, 3.11 and 3.12
+with the native kernel built, and
+`tests/test_python_support.py` parses every shipped module with a 3.9 grammar so
+a newer-only construct cannot land unnoticed.
 
 Run individual checks as standalone scripts:
 
