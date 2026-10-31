@@ -33,7 +33,7 @@ external dependency prevents completion.
 | T12 | P3 | Low | `ssgs.workflows.run_demo` | Failed demo leaves a partial `source.wav` that blocks the next run | VERIFIED |
 | T13 | P3 | Low | `ssgs.model.identify_graph_constraints` | Reported component count includes pruned (dormant) states | VERIFIED |
 | T14 | P3 | Low | `ssgs.core` | Dead code (`_cholesky_lower`, `_forward_solve`) contradicts the docstring | VERIFIED |
-| T15 | P3 | Low | CI matrix, `pyproject.toml` | `requires-python >= 3.9` is asserted but only 3.11/3.12 are tested | VERIFIED |
+| T15 | P3 | Low | CI matrix, `pyproject.toml` | `requires-python >= 3.9` is asserted but only 3.11/3.12 are tested | BLOCKED (guard verified; matrix push blocked) |
 | T16 | P3 | Low | `docs/`, `README.md` | Documentation must match new limits, formats and measurements | VERIFIED |
 | T17 | P1 | Medium | `ssgs.model.export_model`, `save_checkpoint` | Adaptive sufficient statistics lose float64 precision on every save | VERIFIED |
 
@@ -407,7 +407,18 @@ external dependency prevents completion.
   verified by CI only (not available in this environment) and is reported as
   such.
 * **Dependencies:** none.
-* **Status:** VERIFIED — CI matrix now 3.9–3.12; `tests/test_python_support.py` (35 cases) parses every module with the 3.9 grammar, rejects runtime PEP 585/604 annotations without postponed evaluation, and checks the matrix against `requires-python`.
+* **Status:** BLOCKED (partial). `tests/test_python_support.py` is implemented and passing (35
+  cases: 3.9 grammar parse of every module, rejection of runtime PEP 585/604
+  annotations without `from __future__ import annotations`, and a consistency
+  check between `requires-python` and the CI matrix). The CI matrix edit
+  (`python: ["3.9", "3.10", "3.11", "3.12"]`) cannot be published from this
+  environment: the GitHub App token has no `workflows` permission and the push is
+  rejected with *"refusing to allow a GitHub App to create or update workflow
+  `.github/workflows/ci.yml` without `workflows` permission"*. The change is
+  prepared as a local commit on `arena/e15153ba-spectro`; re-run
+  `git push origin arena/e15153ba-spectro` with a `workflows`-scoped token to
+  publish it. Python 3.9/3.10 interpreters are not installed in the build
+  sandbox either, so those matrix entries are not exercised locally.
 
 ## T16 — Align documentation with verified behaviour
 
@@ -425,7 +436,7 @@ external dependency prevents completion.
 * **Required tests:** doc-command smoke test executed manually and recorded in
   the completion report.
 * **Dependencies:** T01 – T15.
-* **Status:** VERIFIED — README (formats incl. Opus, render bounds, measured benchmark table, peak memory, test/CI facts), `docs/TRAINING.md` extension defaults, `docs/TESTING.md` new suites and sanitizer recipe, `docs/ADVERSARIAL_EVALUATION.md` benchmark note; every quoted command was re-run.
+* **Status:** VERIFIED — README (formats incl. Opus, render bounds, measured benchmark table, peak memory, test/CI facts), `docs/TRAINING.md` extension defaults, `docs/TESTING.md` new suites and sanitizer recipe, `docs/ADVERSARIAL_EVALUATION.md` benchmark note; every quoted command was re-run. Distribution artifacts, checksums and the build-environment record were produced for release `v2.0.0-sprint.1` (see the verification log).
 
 ---
 
@@ -507,3 +518,22 @@ libsndfile 1.2.0, native kernels rebuilt with `make` (`-O3`).
   dtypes (`float32` metrics, `int32` zero-crossings); the equivalence oracle in
   `tests/test_resource_bounds.py` asserts dtype as well as value, which is how
   the contract is now pinned.
+
+### Publication
+
+* Branch `arena/e15153ba-spectro` pushed at commit `36f4051` (18 files, +2119/−226) and opened as
+  pull request [#20](https://github.com/recursive-ai-dev/spectro/pull/20).
+* Release [v2.0.0-sprint.1](https://github.com/recursive-ai-dev/spectro/releases/tag/v2.0.0-sprint.1)
+  targets that commit and records the build commands, verification results and
+  artifact checksums.
+* Artifacts (built locally, `dist/`):
+  `spectro-2.0.0-py3-none-any.whl` `29d16b46…693f`,
+  `spectro-2.0.0.tar.gz` `449ef0e0…16ec0`,
+  `spectro_2.0.0-1_amd64.deb` `2d93adf2…17667`, plus `SHA256SUMS` and
+  `BUILD-ENVIRONMENT.json`.
+* **Blocked:** asset uploads fail with `Post "https://uploads.github.com/…": EOF`
+  (that host is not reachable from this sandbox), so the release carries the
+  checksums instead of the binaries; upload them from a networked machine with
+  `gh release upload v2.0.0-sprint.1 dist/python/* dist/*.deb dist/SHA256SUMS dist/BUILD-ENVIRONMENT.json`.
+* **Blocked:** the CI-matrix commit (T15) cannot be pushed without the
+  `workflows` permission (see T15).
