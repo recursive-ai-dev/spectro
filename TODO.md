@@ -407,7 +407,7 @@ external dependency prevents completion.
   verified by CI only (not available in this environment) and is reported as
   such.
 * **Dependencies:** none.
-* **Status:** BLOCKED (partial). `tests/test_python_support.py` is implemented and passing (35
+* **Status:** BLOCKED (partial). `tests/test_python_support.py` is implemented and passing (34
   cases: 3.9 grammar parse of every module, rejection of runtime PEP 585/604
   annotations without `from __future__ import annotations`, and a consistency
   check between `requires-python` and the CI matrix). The CI matrix edit
@@ -415,7 +415,8 @@ external dependency prevents completion.
   environment: the GitHub App token has no `workflows` permission and the push is
   rejected with *"refusing to allow a GitHub App to create or update workflow
   `.github/workflows/ci.yml` without `workflows` permission"*. The change is
-  prepared as a local commit on `arena/e15153ba-spectro`; re-run
+  prepared as a local commit on `arena/e15153ba-spectro` (it also adds the
+  matrix-consistency test, bringing the suite to 35 cases in that file); re-run
   `git push origin arena/e15153ba-spectro` with a `workflows`-scoped token to
   publish it. Python 3.9/3.10 interpreters are not installed in the build
   sandbox either, so those matrix entries are not exercised locally.
@@ -496,7 +497,7 @@ libsndfile 1.2.0, native kernels rebuilt with `make` (`-O3`).
 
 | Check | Command | Result |
 |---|---|---|
-| Full suite | `make test PYTHON=.venv/bin/python` | **290 passed, 6 skipped** in 11.7 s (skips are Tk/desktop and display checks) |
+| Full suite | `make test PYTHON=.venv/bin/python` | **289 passed, 6 skipped** in 11.7 s (skips are Tk/desktop and display checks; the blocked CI commit adds the matrix test, bringing it to 290) |
 | Core self-test | `.venv/bin/python -m ssgs.core` | 4 kernels OK, `ALL CORE SELF-TESTS PASSED` (30 consecutive runs) |
 | Native self-test + benchmark | `.venv/bin/python -m ssgs.native` | verify OK; LPC 4.0×, emission 2.0×, decode 168× |
 | Sanitizers | ASan+UBSan build, `tests/test_native_backend.py` + native fuzzer | 11 passed, no diagnostics |

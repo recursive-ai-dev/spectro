@@ -185,8 +185,10 @@ make test PYTHON=.venv/bin/python
 ```
 
 Measured on the development machine (Python 3.11.2, NumPy 2.4.6, SciPy 1.17.1):
-**290 passed, 6 skipped** (the skips are Tk/desktop checks that require a
-display). CI runs the same suite on Python 3.9, 3.10, 3.11 and 3.12.
+**289 passed, 6 skipped** (the skips are Tk/desktop checks that require a
+display). CI runs the same suite on Python 3.11 and 3.12;
+`tests/test_python_support.py` additionally parses every module with the 3.9
+grammar, the oldest interpreter allowed by `requires-python`.
 
 ## Sanitizer verification
 

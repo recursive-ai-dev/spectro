@@ -417,11 +417,11 @@ transient allocation against the size of the data being processed.
 make test PYTHON=.venv/bin/python     # builds the C kernels, then runs pytest
 ```
 
-The suite contains 296 pytest cases (290 execute here; the remaining 6 need a
-display for the Tk workbench). CI runs it on Python 3.9, 3.10, 3.11 and 3.12
-with the native kernel built, and
-`tests/test_python_support.py` parses every shipped module with a 3.9 grammar so
-a newer-only construct cannot land unnoticed.
+The suite contains 295 pytest cases (289 execute here; the remaining 6 need a
+display for the Tk workbench). CI runs it on Python 3.11 and 3.12 with the native
+kernel built, and `tests/test_python_support.py` parses every shipped module with
+a 3.9 grammar so a newer-only construct cannot land unnoticed (the 3.9/3.10
+matrix entries are prepared; see `TODO.md`, T15).
 
 Run individual checks as standalone scripts:
 
