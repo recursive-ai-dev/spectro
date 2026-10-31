@@ -9,6 +9,7 @@
  * Build: gcc -shared -fPIC -O3 -o libssgs_native.so ssgs_native.c -lm
  */
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -16,6 +17,24 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/*
+ * Overflow-checked allocation for the kernel workspaces.
+ *
+ * The Python wrapper validates every dimension and every dimension product
+ * against INT32_MAX (see ssgs.native._check_product), so index arithmetic
+ * below stays inside a signed 32-bit int.  The *byte* count does not: on a
+ * 32-bit build (the Debian package is "Architecture: any") promoting
+ * "n * sizeof(double)" to size_t can wrap, under-allocating a buffer that the
+ * kernels then write past.  Allocating through this helper keeps the size
+ * computation in size_t and rejects impossible requests instead of corrupting
+ * memory; the kernels fail closed (NaN / -1 sentinels) so the wrapper raises.
+ */
+static void *ssgs_alloc(size_t count, size_t size) {
+    if (count == 0 || size == 0) return NULL;
+    if (count > SIZE_MAX / size) return NULL;
+    return malloc(count * size);
+}
 
 static double logsumexp(const double *x, int n) {
     if (n <= 0) return -1e300;
@@ -33,7 +52,7 @@ void ssgs_lpc_levinson(const double *r, int p, double *a) {
     a[0] = 1.0;
     if (r[0] <= 1e-8 || p <= 0) return;
 
-    double *upd = (double *)malloc((p + 1) * sizeof(double));
+    double *upd = (double *)ssgs_alloc((size_t)p + 1, sizeof(double));
     if (!upd) return;
 
     double err = r[0];
@@ -74,10 +93,11 @@ void ssgs_gaussian_logprobs(const double *means, const double *covs,
                             double *out) {
     if (S <= 0 || p <= 0 || T <= 0) return;
     double c = p * log(2.0 * M_PI);
-    double *L = (double *)malloc(p * p * sizeof(double));
-    double *d = (double *)malloc(p * sizeof(double));
-    double *y = (double *)malloc(p * sizeof(double));
-    double *cj = (double *)malloc(p * p * sizeof(double));
+    size_t p2 = (size_t)p * (size_t)p;
+    double *L = (double *)ssgs_alloc(p2, sizeof(double));
+    double *d = (double *)ssgs_alloc((size_t)p, sizeof(double));
+    double *y = (double *)ssgs_alloc((size_t)p, sizeof(double));
+    double *cj = (double *)ssgs_alloc(p2, sizeof(double));
     if (!L || !d || !y || !cj) {
         free(L); free(d); free(y); free(cj);
         return;
@@ -133,10 +153,11 @@ void ssgs_forward_backward(const double *emit, const double *init,
                            const double *trans, int T, int S,
                            double *gamma, double *xi, double *loglik) {
     if (T <= 0 || S <= 0) return;
-    double *alpha = (double *)malloc(T * S * sizeof(double));
-    double *beta = (double *)malloc(T * S * sizeof(double));
-    double *tmp = (double *)malloc(S * sizeof(double));
-    double *row = (double *)malloc(S * sizeof(double));
+    size_t cells = (size_t)T * (size_t)S;
+    double *alpha = (double *)ssgs_alloc(cells, sizeof(double));
+    double *beta = (double *)ssgs_alloc(cells, sizeof(double));
+    double *tmp = (double *)ssgs_alloc((size_t)S, sizeof(double));
+    double *row = (double *)ssgs_alloc((size_t)S, sizeof(double));
     if (!alpha || !beta || !tmp || !row) {
         free(alpha); free(beta); free(tmp); free(row);
         return;
@@ -181,8 +202,9 @@ void ssgs_decode(const double *trans, const double *smooth,
                  int *path) {
     if (S <= 0 || nframes <= 0) return;
     if (weight <= 0.0) {
-        double *dp = (double *)malloc(nframes * S * sizeof(double));
-        int *back = (int *)malloc(nframes * S * sizeof(int));
+        size_t cells = (size_t)nframes * (size_t)S;
+        double *dp = (double *)ssgs_alloc(cells, sizeof(double));
+        int *back = (int *)ssgs_alloc(cells, sizeof(int));
         if (!dp || !back) { free(dp); free(back); return; }
         for (int s = 0; s < S; s++) dp[s] = init[s];
         for (int t = 1; t < nframes; t++) {
@@ -203,9 +225,10 @@ void ssgs_decode(const double *trans, const double *smooth,
         free(dp); free(back);
         return;
     }
-    double *dps = (double *)malloc(nframes * S * sizeof(double));
-    double *dpt = (double *)malloc(nframes * S * sizeof(double));
-    int *back = (int *)malloc(nframes * S * sizeof(int));
+    size_t cells = (size_t)nframes * (size_t)S;
+    double *dps = (double *)ssgs_alloc(cells, sizeof(double));
+    double *dpt = (double *)ssgs_alloc(cells, sizeof(double));
+    int *back = (int *)ssgs_alloc(cells, sizeof(int));
     if (!dps || !dpt || !back) { free(dps); free(dpt); free(back); return; }
     for (int s = 0; s < S; s++) { dps[s] = 0.0; dpt[s] = init[s]; }
     double tol = 1e-9;

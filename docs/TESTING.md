@@ -160,3 +160,46 @@ python tests/test_checkpoints.py
 ## Expected Outcomes
 - Scripts complete without import errors when dependencies are installed.
 - Checkpoint and adaptive APIs execute with real signals, confirming documented behavior.
+
+---
+
+# TESTING — Adversarial Rust-Proofing Suites (2025 sprint)
+
+Five modules reproduce failures that were observed on real inputs and assert the
+corrected contract (not merely that a call returns). They run under pytest and
+need no display; the native-backend module skips when `libssgs_native.so` has not
+been built with `make`.
+
+| Module | Covers | Representative cases |
+|---|---|---|
+| `tests/test_state_integrity.py` | archive validation (T01, T17), re-training state (T03), augmentation boundaries (T07), fidelity warning (T08), metadata indices (T11), graph components (T13) | 8-case `.npz` tamper matrix, `.safetensors` tamper, bit-exact float64 round trip, injected frame-dropping processor, boolean/negative/out-of-range indices |
+| `tests/test_resource_bounds.py` | render limits (T02), streamed metadata (T04), frame batching (T04) | rate 768 000/768 001, duration 3600/3601, 2**28 sample cap, CLI exit code 1 without traceback, 48 bit-exact metadata cases, tracemalloc bounds |
+| `tests/test_publishing_and_formats.py` | Opus input (T05), atomic publish (T06), demo cleanup (T12) | `.opus` discovery + training, `os.link` forced to `EXDEV`, no-clobber/forced overwrite, temp-file cleanup, failing demo rollback |
+| `tests/test_native_backend.py` | C/Python parity (T10), benchmark honesty and stdout silence (T09) | 8 randomised shape/parameter trials across all four kernels, parsed benchmark table, empty stdout for library calls |
+| `tests/test_python_support.py` | declared 3.9 floor (T15) | 3.9 grammar parse of every module, rejected runtime PEP 585/604 annotations, CI matrix covers `requires-python` |
+
+Run everything (builds the C kernels first):
+
+```bash
+make test PYTHON=.venv/bin/python
+```
+
+Measured on the development machine (Python 3.11.2, NumPy 2.4.6, SciPy 1.17.1):
+**289 passed, 6 skipped** (the skips are Tk/desktop checks that require a
+display). CI runs the same suite on Python 3.11 and 3.12;
+`tests/test_python_support.py` additionally parses every module with the 3.9
+grammar, the oldest interpreter allowed by `requires-python`.
+
+## Sanitizer verification
+
+The C kernels are additionally exercised under AddressSanitizer and
+UndefinedBehaviorSanitizer:
+
+```bash
+gcc -shared -fPIC -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -o /tmp/libssgs_asan.so src/ssgs/ssgs_native.c
+cp /tmp/libssgs_asan.so src/ssgs/libssgs_native.so
+LD_PRELOAD=$(gcc -print-file-name=libasan.so) ASAN_OPTIONS=detect_leaks=0 \
+    .venv/bin/python -m pytest tests/test_native_backend.py -q
+make    # restore the optimised library afterwards
+```

@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--output", "-o", required=True, help=".npz or .safetensors model")
     train.add_argument("--states", type=int, default=16)
     train.add_argument("--iterations", type=int, default=10)
-    train.add_argument("--sample-rate", type=int, default=16000)
+    train.add_argument("--sample-rate", type=int, default=16000, help="analysis rate in Hz (max 768000)")
     train.add_argument("--lpc-order", type=int, default=12)
     train.add_argument("--frame-size", type=int, default=1024)
     train.add_argument("--hop-size", type=int, default=256)
@@ -44,8 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate = commands.add_parser("generate", help="render a model to a 24-bit WAV")
     generate.add_argument("model")
     generate.add_argument("--output", "-o", required=True)
-    generate.add_argument("--duration", type=float, default=3.0, help="duration in seconds (default: 3)")
-    generate.add_argument("--sample-rate", type=int, default=22050)
+    generate.add_argument("--duration", type=float, default=3.0, help="duration in seconds (default: 3; max 3600)")
+    generate.add_argument(
+        "--sample-rate", type=int, default=22050,
+        help="output rate in Hz (max 768000, and at most 268435456 samples per render)",
+    )
     generate.add_argument("--method", choices=("stochastic", "viterbi"), default="stochastic")
     generate.add_argument("--seed", type=int, default=0)
     generate.add_argument("--fidelity", type=float, default=0.0)
@@ -130,7 +133,7 @@ def main(argv=None) -> int:
     except workflows.WorkflowCancelled as exc:
         print(f"spectro: {exc}", file=sys.stderr)
         return 130
-    except (ValueError, OSError, RuntimeError, ImportError, FloatingPointError) as exc:
+    except (ValueError, OSError, RuntimeError, ImportError, FloatingPointError, MemoryError, OverflowError) as exc:
         if args.verbose:
             logging.exception("Operation failed")
         else:

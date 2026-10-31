@@ -38,6 +38,7 @@ from typing import List, Optional
 import numpy as np
 
 from ssgs import SpectralStateGuidedSynthesis
+from ssgs.workflows import supported_audio_extensions
 
 # Configure logging
 logging.basicConfig(
@@ -54,7 +55,10 @@ def find_audio_files(
 ) -> List[Path]:
     """Find supported audio files case-insensitively and return a stable unique list."""
     if extensions is None:
-        extensions = [".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"]
+        # Single source of truth: the formats the installed libsndfile can
+        # actually decode (the previous hard-coded list advertised .m4a/.aac,
+        # which libsndfile cannot read, and omitted .opus, which it can).
+        extensions = sorted(supported_audio_extensions())
     normalized_extensions = {
         (extension if str(extension).startswith(".") else f".{extension}").casefold()
         for extension in extensions

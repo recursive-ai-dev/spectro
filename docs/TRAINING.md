@@ -87,7 +87,8 @@ Options:
 
   --extensions EXT [EXT ...]
                         Audio file extensions to process
-                        (default: .mp3 .wav .flac .ogg)
+                        (default: every format the installed libsndfile
+                        reports, e.g. .wav .flac .ogg .opus .aiff .mp3)
 ```
 
 ### Examples
