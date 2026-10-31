@@ -415,11 +415,11 @@ external dependency prevents completion.
   environment: the GitHub App token has no `workflows` permission and the push is
   rejected with *"refusing to allow a GitHub App to create or update workflow
   `.github/workflows/ci.yml` without `workflows` permission"*. The change is
-  prepared as a local commit on `arena/e15153ba-spectro` (it also adds the
-  matrix-consistency test, bringing the suite to 35 cases in that file); re-run
-  `git push origin arena/e15153ba-spectro` with a `workflows`-scoped token to
-  publish it. Python 3.9/3.10 interpreters are not installed in the build
-  sandbox either, so those matrix entries are not exercised locally.
+  preserved as `dist/0001-ci-exercise-Python-3.9-and-3.10-with-the-guard-that-.patch`
+  (CI matrix + the matrix-consistency test, which brings this file to 35 cases);
+  apply it with `git am` and push from a checkout whose token has the
+  `workflows` scope. Python 3.9/3.10 interpreters are not installed in the build
+  sandbox either, so those matrix entries are exercised by CI only.
 
 ## T16 — Align documentation with verified behaviour
 
